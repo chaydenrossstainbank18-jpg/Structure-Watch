@@ -125,6 +125,27 @@
   .log-empty{ color: var(--faint); font-size: 12px; text-align:center; padding: 22px 0; font-family:'JetBrains Mono', monospace; }
 
   .footnote{ font-size: 11px; color: var(--faint); text-align:center; line-height:1.6; margin-top: 30px; }
+
+  .risk-row{ display:flex; gap:10px; margin: 12px 0 14px; }
+  .risk-field{ flex:1; }
+  .risk-field label{
+    display:block; font-family:'JetBrains Mono', monospace; font-size: 10px; color: var(--mute);
+    letter-spacing: 0.04em; margin-bottom: 5px; text-transform: uppercase;
+  }
+  .risk-field input{
+    width: 100%; background: rgba(255,255,255,0.03); border: 1px solid var(--hairline);
+    border-radius: 8px; padding: 9px 10px; color: var(--ink); font-family:'JetBrains Mono', monospace;
+    font-size: 14px;
+  }
+  .risk-field input:focus{ outline: none; border-color: var(--long); }
+  .alertBtn{
+    width: 100%; background: var(--long-dim); color: var(--long); border: 1px solid rgba(63,224,160,0.3);
+    border-radius: 8px; padding: 11px; font-family:'JetBrains Mono', monospace; font-size: 12.5px;
+    font-weight: 600; cursor: pointer; transition: all 0.15s ease;
+  }
+  .alertBtn.on{ background: rgba(63,224,160,0.18); }
+  .log-why{ color: var(--ink); grid-column: 1 / -1; font-size: 10.5px; margin-top: 2px; line-height:1.45; }
+  .log-risk-amt{ color: var(--faint); }
 </style>
 </head>
 <body>
@@ -136,6 +157,28 @@
       <h1>Structure Watch</h1>
     </div>
     <div class="status"><span class="dot" id="statusDot"></span><span id="statusText">Connecting…</span></div>
+  </div>
+
+  <div class="panel" id="riskPanel">
+    <div class="panel-head">
+      <div>
+        <div class="sym-name">Account &amp; Risk</div>
+        <div class="sym-tf">SET ONCE · SAVED ON THIS DEVICE</div>
+      </div>
+      <div id="signalCount" class="sym-tf" style="text-align:right; margin-top:4px;">0 signals today</div>
+    </div>
+    <div class="risk-row">
+      <div class="risk-field">
+        <label for="acctBalance">Account size (USD)</label>
+        <input type="number" id="acctBalance" inputmode="decimal" placeholder="e.g. 5000" />
+      </div>
+      <div class="risk-field">
+        <label for="riskPct">Risk per trade (%)</label>
+        <input type="number" id="riskPct" inputmode="decimal" value="1" step="0.5" />
+      </div>
+    </div>
+    <button class="alertBtn" id="alertBtn" onclick="enableAlerts()">🔔 Enable sound + notification alerts</button>
+    <div id="alertStatus" class="sym-tf" style="margin-top:8px;">Alerts off — tap to enable. For alerts to work when the screen is locked, add this page to your Home Screen first.</div>
   </div>
 
   <div class="panel" id="panel-frxXAUUSD">
@@ -166,20 +209,35 @@
     <div class="fvg-chips" id="fvg-stpRNG"><div class="fvg-empty">No active FVG zones yet</div></div>
   </div>
 
+  <div class="panel" id="panel-R_25">
+    <div class="panel-head">
+      <div>
+        <div class="sym-name">Volatility 25</div>
+        <div class="sym-tf">R_25</div>
+      </div>
+      <div class="sym-price" id="price-R_25">—</div>
+    </div>
+    <div class="tf-strip" id="strip-R_25"></div>
+    <div class="trigger-line" id="trigger-R_25"></div>
+    <canvas id="chart-R_25"></canvas>
+    <div class="fvg-chips" id="fvg-R_25"><div class="fvg-empty">No active FVG zones yet</div></div>
+  </div>
+
   <div class="panel">
     <div class="log-head">Signal Log</div>
     <div class="log-sub">Live entries · newest first</div>
     <div id="logList"><div class="log-empty">Watching for Strat + structure alignment…</div></div>
   </div>
 
-  <p class="footnote">A signal only fires when a Strat trigger or FVG retest agrees with the structure bias on that timeframe AND the higher timeframe(s) above it — 1m needs 5m and 1h to agree, 5m needs 1h to agree. A minimum gap between signals on the same timeframe prevents rapid clustering. This is a rules-based read of price action, not a guarantee or financial advice.</p>
+  <p class="footnote">A signal only fires when a Strat trigger or FVG retest agrees with the structure bias on that timeframe AND the higher timeframe(s) above it. A minimum gap between signals on the same timeframe prevents rapid clustering. The risk reference uses your entered account size and risk % only to estimate a dollar amount — it does not calculate lot size, since point value differs by instrument and broker; confirm that with your contract specs before sizing a position. For alerts to keep working with the screen locked, add this page to your Home Screen via Safari's share menu. This is a rules-based read of price action, not a guarantee or financial advice.</p>
 
 </div>
 
 <script>
   const SYMBOLS = [
     { code: 'frxXAUUSD', name: 'GOLD' },
-    { code: 'stpRNG', name: 'STEP' }
+    { code: 'stpRNG', name: 'STEP' },
+    { code: 'R_25', name: 'VIX25' }
   ];
   const TIMEFRAMES = [
     { key: '1m', seconds: 60, label: '1M' },
@@ -196,6 +254,68 @@
     });
   });
   const signalLog = [];
+
+  // --- Account, risk, alerts, daily counter ---
+  const acctBalanceEl = document.getElementById('acctBalance');
+  const riskPctEl = document.getElementById('riskPct');
+  acctBalanceEl.value = localStorage.getItem('sw_balance') || '';
+  riskPctEl.value = localStorage.getItem('sw_riskPct') || '1';
+  acctBalanceEl.addEventListener('input', () => localStorage.setItem('sw_balance', acctBalanceEl.value));
+  riskPctEl.addEventListener('input', () => localStorage.setItem('sw_riskPct', riskPctEl.value));
+
+  function todayKey(){ return new Date().toISOString().slice(0, 10); }
+  let dailyCount = (localStorage.getItem('sw_countDate') === todayKey()) ? (+localStorage.getItem('sw_count') || 0) : 0;
+  function bumpDailyCount(){
+    dailyCount++;
+    localStorage.setItem('sw_countDate', todayKey());
+    localStorage.setItem('sw_count', dailyCount);
+    document.getElementById('signalCount').textContent = dailyCount + ' signal' + (dailyCount === 1 ? '' : 's') + ' today';
+  }
+  document.getElementById('signalCount').textContent = dailyCount + ' signal' + (dailyCount === 1 ? '' : 's') + ' today';
+
+  let alertsOn = false;
+  let audioCtx = null;
+  window.enableAlerts = function(){
+    alertsOn = true;
+    const btn = document.getElementById('alertBtn');
+    btn.classList.add('on');
+    btn.textContent = '🔔 Alerts on';
+    try{
+      audioCtx = audioCtx || new (window.AudioContext || window.webkitAudioContext)();
+      playChime();
+    }catch(e){}
+    if('Notification' in window && Notification.permission !== 'granted'){
+      Notification.requestPermission().then(p => {
+        document.getElementById('alertStatus').textContent = p === 'granted'
+          ? 'Sound + notifications on for this tab.'
+          : 'Sound on. Notifications blocked — you can allow them in Safari\'s site settings.';
+      });
+    } else {
+      document.getElementById('alertStatus').textContent = 'Sound + notifications on for this tab.';
+    }
+  };
+
+  function playChime(){
+    if(!alertsOn || !audioCtx) return;
+    try{
+      const o = audioCtx.createOscillator();
+      const g = audioCtx.createGain();
+      o.type = 'sine'; o.frequency.value = 880;
+      g.gain.setValueAtTime(0.0001, audioCtx.currentTime);
+      g.gain.exponentialRampToValueAtTime(0.25, audioCtx.currentTime + 0.02);
+      g.gain.exponentialRampToValueAtTime(0.0001, audioCtx.currentTime + 0.35);
+      o.connect(g); g.connect(audioCtx.destination);
+      o.start(); o.stop(audioCtx.currentTime + 0.35);
+    }catch(e){}
+  }
+
+  function notify(title, body){
+    if(!alertsOn) return;
+    playChime();
+    if('Notification' in window && Notification.permission === 'granted'){
+      try{ new Notification(title, { body }); }catch(e){}
+    }
+  }
 
   let ws = null;
   let reconnectTimer = null;
@@ -231,6 +351,19 @@
     if(reconnectTimer) return;
     reconnectTimer = setTimeout(() => { reconnectTimer = null; connect(); }, 4000);
   }
+
+  document.addEventListener('visibilitychange', () => {
+    if(document.visibilityState === 'visible' && (!ws || ws.readyState !== WebSocket.OPEN)){
+      if(reconnectTimer){ clearTimeout(reconnectTimer); reconnectTimer = null; }
+      connect();
+    }
+  });
+
+  setInterval(() => {
+    if(ws && ws.readyState === WebSocket.OPEN){
+      try{ ws.send(JSON.stringify({ ping: 1 })); }catch(e){}
+    }
+  }, 25000);
 
   function subscribe(symbol, granularity){
     ws.send(JSON.stringify({
@@ -372,8 +505,12 @@
         const currentIdx = c.length - 1;
         if(slot.bias === dirBias && strongBody && htfAligned && canFire(slot, currentIdx)){
           const side = sp.dir === 'up' ? 'BUY' : 'SELL';
+          const brokenLevel = dirBias === 'bullish' ? slot.lastSwingHigh : slot.lastSwingLow;
+          const levelTxt = brokenLevel ? ` Price closed through the prior swing at ${brokenLevel.price.toFixed(2)}.` : '';
+          const htfTxt = tf === '1m' ? ' 5m and 1h are both confirming the same direction.'
+            : tf === '5m' ? ' 1h is also confirming the same direction.' : '';
           fireSignal(symbol, tf, side, lastClose,
-            `Strat ${sp.pattern} aligned with ${dirBias} structure, higher-timeframe confirmed`);
+            `Strat ${sp.pattern} triggered ${dirBias}.${levelTxt}${htfTxt}`);
           slot.lastFireIdx = currentIdx;
         }
       }
@@ -401,11 +538,13 @@
       const inZone = price <= z.top && price >= z.bottom;
       if(!inZone) return;
       if(z.type === 'bullish' && slot.bias === 'bullish' && isHigherTfAligned(symbol, tf, 'bullish') && canFire(slot, currentIdx)){
-        fireSignal(symbol, tf, 'BUY', price, `FVG retest ${z.bottom.toFixed(2)}–${z.top.toFixed(2)}, higher-timeframe confirmed`);
+        const htfTxt = tf === '1m' ? ' 5m and 1h both agree bullish.' : tf === '5m' ? ' 1h also agrees bullish.' : '';
+        fireSignal(symbol, tf, 'BUY', price, `Price retraced into a bullish FVG (${z.bottom.toFixed(2)}–${z.top.toFixed(2)}) inside an active bullish structure.${htfTxt}`);
         slot.lastFireIdx = currentIdx;
         z.mitigated = true;
       } else if(z.type === 'bearish' && slot.bias === 'bearish' && isHigherTfAligned(symbol, tf, 'bearish') && canFire(slot, currentIdx)){
-        fireSignal(symbol, tf, 'SELL', price, `FVG retest ${z.bottom.toFixed(2)}–${z.top.toFixed(2)}, higher-timeframe confirmed`);
+        const htfTxt = tf === '1m' ? ' 5m and 1h both agree bearish.' : tf === '5m' ? ' 1h also agrees bearish.' : '';
+        fireSignal(symbol, tf, 'SELL', price, `Price retraced into a bearish FVG (${z.bottom.toFixed(2)}–${z.top.toFixed(2)}) inside an active bearish structure.${htfTxt}`);
         slot.lastFireIdx = currentIdx;
         z.mitigated = true;
       } else if(slot.bias !== 'bullish' && slot.bias !== 'bearish'){
@@ -435,9 +574,15 @@
 
   function fireSignal(symbol, tf, side, price, reason){
     const { sl, tp } = getSLTP(symbol, tf, side, price);
-    signalLog.unshift({ time: new Date(), symbol, tf, side, price, sl, tp, reason });
+    const balance = parseFloat(acctBalanceEl.value);
+    const riskPct = parseFloat(riskPctEl.value) || 1;
+    const riskAmount = (balance && balance > 0) ? balance * (riskPct / 100) : null;
+    signalLog.unshift({ time: new Date(), symbol, tf, side, price, sl, tp, reason, riskAmount, riskPct });
     if(signalLog.length > 50) signalLog.pop();
     renderLog();
+    bumpDailyCount();
+    const sym = SYMBOLS.find(x => x.code === symbol);
+    notify(`${side} ${sym ? sym.name : symbol} · ${tf}`, reason);
   }
 
   function renderLog(){
@@ -455,8 +600,8 @@
         <div class="log-tf">${s.tf}</div>
         <div class="log-side ${s.side.toLowerCase()}">${s.side}</div>
         <div class="log-price">${s.price.toFixed(2)}</div>
-        <div class="log-reason">${s.reason}</div>
-        <div class="log-risk">SL ${s.sl.toFixed(2)} · TP ${s.tp.toFixed(2)} · R 1:3</div>
+        <div class="log-why">Why: ${s.reason}</div>
+        <div class="log-risk">SL ${s.sl.toFixed(2)} · TP ${s.tp.toFixed(2)} · R 1:3${s.riskAmount ? ` <span class="log-risk-amt">· risking ~$${s.riskAmount.toFixed(2)} (${s.riskPct}% of balance) — confirm point value with your broker</span>` : ''}</div>
       </div>`;
     }).join('');
   }
