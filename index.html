@@ -164,6 +164,23 @@
   .perf-stat{ flex:1; background: rgba(255,255,255,0.02); border: 1px solid var(--hairline); border-radius: 8px; padding: 10px; text-align:center; }
   .perf-stat .v{ font-family:'JetBrains Mono', monospace; font-size: 16px; font-weight: 700; color: var(--ink); }
   .perf-stat .l{ font-family:'JetBrains Mono', monospace; font-size: 9.5px; color: var(--mute); text-transform: uppercase; letter-spacing: 0.05em; margin-top: 3px; }
+
+  .gold-plan{
+    margin-top: 8px; padding: 11px 13px; border-radius: 9px;
+    background: linear-gradient(135deg, rgba(239,170,63,0.14), rgba(239,170,63,0.02));
+    border: 1px solid rgba(239,170,63,0.3);
+    display: flex; justify-content: space-between; align-items: center; gap: 10px;
+    grid-column: 1 / -1;
+  }
+  .gold-plan .gp-left .gp-label{ font-family:'JetBrains Mono', monospace; font-size: 9.5px; color: var(--signal); text-transform: uppercase; letter-spacing: 0.06em; margin-bottom: 3px; }
+  .gold-plan .gp-left .gp-lot{ font-family:'JetBrains Mono', monospace; font-size: 22px; font-weight: 700; color: var(--ink); }
+  .gold-plan .gp-left .gp-lot span{ font-size: 11px; color: var(--mute); font-weight: 500; }
+  .gold-plan .gp-right{ text-align: right; font-family:'JetBrains Mono', monospace; font-size: 10.5px; color: var(--mute); line-height: 1.5; }
+  .gold-plan.unreachable{
+    background: linear-gradient(135deg, rgba(240,86,111,0.14), rgba(240,86,111,0.02));
+    border-color: rgba(240,86,111,0.3);
+  }
+  .gold-plan.unreachable .gp-label{ color: var(--short); }
 </style>
 </head>
 <body>
@@ -756,13 +773,29 @@
     return { sl, tp };
   }
 
+  // --- Gold-only position sizing for a fixed max risk, entirely separate from signal-firing logic ---
+  function goldPositionPlan(entry, sl, maxRiskUsd){
+    const slDistance = Math.abs(entry - sl);
+    const dollarPerPointPerLot = pointValue.frxXAUUSD * 10; // $10/point at 0.1 lot → $100/point at 1.0 lot
+    const rawLot = maxRiskUsd / (slDistance * dollarPerPointPerLot);
+    const roundedLot = Math.floor(rawLot * 100) / 100;
+    const minLot = 0.01;
+    const minLotRisk = minLot * slDistance * dollarPerPointPerLot;
+    if(roundedLot >= minLot){
+      const actualRisk = roundedLot * slDistance * dollarPerPointPerLot;
+      return { achievable: true, lot: roundedLot, actualRisk, slDistance };
+    }
+    return { achievable: false, minLot, minLotRisk, slDistance };
+  }
+
   function fireSignal(symbol, tf, side, price, reason){
     const { sl, tp } = getSLTP(symbol, tf, side, price);
     const balance = parseFloat(acctBalanceEl.value);
     const riskPct = parseFloat(riskPctEl.value) || 1;
     const riskAmount = (balance && balance > 0) ? balance * (riskPct / 100) : null;
     const quality = assessTradeQuality(symbol, tf, side, price, sl, tp);
-    signalLog.unshift({ time: new Date(), symbol, tf, side, price, sl, tp, reason, riskAmount, riskPct, quality, status: 'open', exitPrice: null, pnl: null });
+    const goldPlan = symbol === 'frxXAUUSD' ? goldPositionPlan(price, sl, 2) : null;
+    signalLog.unshift({ time: new Date(), symbol, tf, side, price, sl, tp, reason, riskAmount, riskPct, quality, goldPlan, status: 'open', exitPrice: null, pnl: null });
     if(signalLog.length > 50) signalLog.pop();
     renderLog();
     updatePerformancePanel();
@@ -782,6 +815,23 @@
       const outcomeHtml = s.status === 'open'
         ? `<div class="log-outcome open">Status: open, tracking toward SL/TP</div>`
         : `<div class="log-outcome ${s.status}">${s.status === 'win' ? 'Hit TP' : 'Hit SL'}${s.pnl != null ? ` · ${s.pnl >= 0 ? '+' : ''}$${s.pnl.toFixed(2)} (0.1 lot, simulated)` : ' · point value not set for this instrument'}</div>`;
+      const goldPlanHtml = s.goldPlan
+        ? (s.goldPlan.achievable
+          ? `<div class="gold-plan">
+              <div class="gp-left">
+                <div class="gp-label">Entry size · max $2 risk</div>
+                <div class="gp-lot">${s.goldPlan.lot.toFixed(2)} <span>lot</span></div>
+              </div>
+              <div class="gp-right">Stop ${s.goldPlan.slDistance.toFixed(2)} pts away<br/>Actual risk ≈ $${s.goldPlan.actualRisk.toFixed(2)}</div>
+            </div>`
+          : `<div class="gold-plan unreachable">
+              <div class="gp-left">
+                <div class="gp-label">$2 cap not reachable</div>
+                <div class="gp-lot">0.01 <span>lot min</span></div>
+              </div>
+              <div class="gp-right">Stop ${s.goldPlan.slDistance.toFixed(2)} pts away<br/>Minimum size risks ≈ $${s.goldPlan.minLotRisk.toFixed(2)}</div>
+            </div>`)
+        : '';
       return `
       <div class="log-row ${s.side.toLowerCase()}">
         <div class="log-time">${s.time.toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'})}</div>
@@ -791,6 +841,7 @@
         <div class="log-price">${s.price.toFixed(2)}</div>
         <div class="log-why">Why: ${s.reason}</div>
         <div class="log-risk">SL ${s.sl.toFixed(2)} · TP ${s.tp.toFixed(2)} · R 1:3${s.riskAmount ? ` <span class="log-risk-amt">· risking ~$${s.riskAmount.toFixed(2)} (${s.riskPct}% of balance) — confirm point value with your broker</span>` : ''}</div>
+        ${goldPlanHtml}
         <div class="log-quality ${s.quality.warn ? 'warn' : 'ok'}">${s.quality.warn ? '⚠' : '✓'} ${s.quality.text}</div>
         ${outcomeHtml}
       </div>`;
