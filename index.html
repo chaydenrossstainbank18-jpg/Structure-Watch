@@ -319,6 +319,7 @@
 
   let ws = null;
   let reconnectTimer = null;
+  let everConnected = false;
 
   function setStatus(mode, text){
     const dot = document.getElementById('statusDot');
@@ -338,7 +339,9 @@
     }
     ws.onopen = () => {
       setStatus('live', 'Live');
-      SYMBOLS.forEach(sym => TIMEFRAMES.forEach(tf => subscribe(sym.code, tf.seconds)));
+      const firstConnect = !everConnected;
+      everConnected = true;
+      SYMBOLS.forEach(sym => TIMEFRAMES.forEach(tf => subscribe(sym.code, tf.seconds, firstConnect)));
     };
     ws.onmessage = (msg) => {
       try{ handleMessage(JSON.parse(msg.data)); }catch(e){}
@@ -365,7 +368,7 @@
     }
   }, 25000);
 
-  function subscribe(symbol, granularity){
+  function subscribe(symbol, granularity, firstConnect){
     ws.send(JSON.stringify({
       ticks_history: symbol,
       adjust_start_time: 1,
@@ -374,7 +377,8 @@
       start: 1,
       style: 'candles',
       granularity: granularity,
-      subscribe: 1
+      subscribe: 1,
+      passthrough: { firstConnect: !!firstConnect }
     }));
   }
 
@@ -411,11 +415,16 @@
       const tf = TF_BY_SECONDS[data.echo_req.granularity];
       if(!state[symbol] || !tf) return;
       const slot = state[symbol][tf];
+      const firstConnect = !!(data.passthrough && data.passthrough.firstConnect);
       slot.candles = data.candles.map(c => ({ open_time: +c.epoch, open: +c.open, high: +c.high, low: +c.low, close: +c.close }));
       slot.types = slot.candles.map((c, i) => i === 0 ? null : classifyStrat(c, slot.candles[i-1]));
-      analyzeStructure(symbol, tf, true);
+      recomputeStructure(symbol, tf);
       slot.initialized = true;
       state[symbol].lastPrice = slot.candles[slot.candles.length - 1].close;
+      if(!firstConnect){
+        evaluateStratTrigger(symbol, tf);
+        checkLiveSignal(symbol, tf, state[symbol].lastPrice);
+      }
       renderAll(symbol);
     } else if(data.msg_type === 'ohlc' && data.ohlc){
       const o = data.ohlc;
@@ -434,7 +443,8 @@
         if(last && candles.length >= 1){
           const newType = classifyStrat(last, candles[candles.length - 2]);
           slot.types[candles.length - 1] = newType;
-          analyzeStructure(symbol, tf, false);
+          recomputeStructure(symbol, tf);
+          evaluateStratTrigger(symbol, tf);
         }
         candles.push({ open_time: openEpoch, open: +o.open, high: +o.high, low: +o.low, close: +o.close });
         slot.types.push(null);
@@ -448,7 +458,7 @@
     }
   }
 
-  function analyzeStructure(symbol, tf, isInitial){
+  function recomputeStructure(symbol, tf){
     const slot = state[symbol][tf];
     const c = slot.candles;
     if(c.length < 10) return;
@@ -467,6 +477,7 @@
     if(lastSwingHigh) slot.lastSwingHigh = lastSwingHigh;
     if(lastSwingLow) slot.lastSwingLow = lastSwingLow;
     const lastClose = c[c.length - 1].close;
+    const lastTime = c[c.length - 1].open_time;
     const prevBias = slot.bias;
     let newBias = prevBias;
     let brokeUp = false, brokeDown = false;
@@ -474,9 +485,23 @@
     if(lastSwingHigh && lastClose > lastSwingHigh.price){ newBias = 'bullish'; brokeUp = true; }
     if(lastSwingLow && lastClose < lastSwingLow.price){ newBias = 'bearish'; brokeDown = true; }
 
-    if((brokeUp || brokeDown) && !isInitial){
+    if(newBias === 'neutral'){
+      const highs = swings.filter(s => s.type === 'high');
+      const lows = swings.filter(s => s.type === 'low');
+      if(highs.length >= 2 && lows.length >= 2){
+        const higherHighs = highs[highs.length - 1].price > highs[highs.length - 2].price;
+        const higherLows = lows[lows.length - 1].price > lows[lows.length - 2].price;
+        if(higherHighs && higherLows) newBias = 'bullish';
+        else if(!higherHighs && !higherLows) newBias = 'bearish';
+      }
+    }
+
+    const lastEvent = slot.events[slot.events.length - 1];
+    const tfSeconds = TIMEFRAMES.find(t => t.key === tf).seconds;
+    const isDuplicateEvent = lastEvent && lastEvent.dir === (brokeUp ? 'up' : 'down') && (lastTime - lastEvent.time) < tfSeconds * 3;
+    if((brokeUp || brokeDown) && !isDuplicateEvent){
       const label = (brokeUp && prevBias === 'bearish') || (brokeDown && prevBias === 'bullish') ? 'CHoCH' : 'BOS';
-      slot.events.push({ idx: c.length - 1, type: label, dir: brokeUp ? 'up' : 'down' });
+      slot.events.push({ time: lastTime, type: label, dir: brokeUp ? 'up' : 'down' });
       if(slot.events.length > 30) slot.events.shift();
     }
     slot.bias = newBias;
@@ -485,35 +510,37 @@
     if(n >= 3){
       const a = c[n-3], b = c[n-1];
       if(a.high < b.low){
-        slot.fvgs.push({ type: 'bullish', top: b.low, bottom: a.high, idx: n-1, mitigated: false });
+        slot.fvgs.push({ type: 'bullish', top: b.low, bottom: a.high, time: lastTime, mitigated: false });
       } else if(a.low > b.high){
-        slot.fvgs.push({ type: 'bearish', top: a.low, bottom: b.high, idx: n-1, mitigated: false });
+        slot.fvgs.push({ type: 'bearish', top: a.low, bottom: b.high, time: lastTime, mitigated: false });
       }
       if(slot.fvgs.length > 25) slot.fvgs.shift();
     }
+  }
 
-    if(!isInitial){
-      const sp = detectStratPattern(slot.types.filter(t => t !== null));
-      if(sp){
-        slot.lastStrat = { pattern: sp.pattern, dir: sp.dir, time: new Date() };
-        const dirBias = sp.dir === 'up' ? 'bullish' : 'bearish';
-        const triggerCandle = c[c.length - 1];
-        const range = triggerCandle.high - triggerCandle.low;
-        const body = Math.abs(triggerCandle.close - triggerCandle.open);
-        const strongBody = range > 0 && (body / range) >= 0.4;
-        const htfAligned = isHigherTfAligned(symbol, tf, dirBias);
-        const currentIdx = c.length - 1;
-        if(slot.bias === dirBias && strongBody && htfAligned && canFire(slot, currentIdx)){
-          const side = sp.dir === 'up' ? 'BUY' : 'SELL';
-          const brokenLevel = dirBias === 'bullish' ? slot.lastSwingHigh : slot.lastSwingLow;
-          const levelTxt = brokenLevel ? ` Price closed through the prior swing at ${brokenLevel.price.toFixed(2)}.` : '';
-          const htfTxt = tf === '1m' ? ' 5m and 1h are both confirming the same direction.'
-            : tf === '5m' ? ' 1h is also confirming the same direction.' : '';
-          fireSignal(symbol, tf, side, lastClose,
-            `Strat ${sp.pattern} triggered ${dirBias}.${levelTxt}${htfTxt}`);
-          slot.lastFireIdx = currentIdx;
-        }
-      }
+  function evaluateStratTrigger(symbol, tf){
+    const slot = state[symbol][tf];
+    const c = slot.candles;
+    if(c.length < 3) return;
+    const sp = detectStratPattern(slot.types.filter(t => t !== null));
+    if(!sp) return;
+    slot.lastStrat = { pattern: sp.pattern, dir: sp.dir, time: new Date() };
+    const dirBias = sp.dir === 'up' ? 'bullish' : 'bearish';
+    const triggerCandle = c[c.length - 1];
+    const range = triggerCandle.high - triggerCandle.low;
+    const body = Math.abs(triggerCandle.close - triggerCandle.open);
+    const strongBody = range > 0 && (body / range) >= 0.4;
+    const htfAligned = isHigherTfAligned(symbol, tf, dirBias);
+    const currentTime = triggerCandle.open_time;
+    if(slot.bias === dirBias && strongBody && htfAligned && canFire(slot, currentTime, tf)){
+      const side = sp.dir === 'up' ? 'BUY' : 'SELL';
+      const brokenLevel = dirBias === 'bullish' ? slot.lastSwingHigh : slot.lastSwingLow;
+      const levelTxt = brokenLevel ? ` Price closed through the prior swing at ${brokenLevel.price.toFixed(2)}.` : '';
+      const htfTxt = tf === '1m' ? ' 5m and 1h are both confirming the same direction.'
+        : tf === '5m' ? ' 1h is also confirming the same direction.' : '';
+      fireSignal(symbol, tf, side, triggerCandle.close,
+        `Strat ${sp.pattern} triggered ${dirBias}.${levelTxt}${htfTxt}`);
+      slot.lastFireTime = currentTime;
     }
   }
 
@@ -523,29 +550,31 @@
     return true;
   }
 
-  function canFire(slot, currentIdx, cooldown){
-    cooldown = cooldown || 4;
-    if(slot.lastFireIdx === undefined) slot.lastFireIdx = -999;
-    return (currentIdx - slot.lastFireIdx) >= cooldown;
+  function canFire(slot, currentTime, tf){
+    const tfSeconds = TIMEFRAMES.find(t => t.key === tf).seconds;
+    const cooldown = tfSeconds * 4;
+    if(slot.lastFireTime === undefined) slot.lastFireTime = -Infinity;
+    return (currentTime - slot.lastFireTime) >= cooldown;
   }
 
   function checkLiveSignal(symbol, tf, price){
     const slot = state[symbol][tf];
     if(!slot.initialized) return;
-    const currentIdx = slot.candles.length - 1;
+    const currentCandle = slot.candles[slot.candles.length - 1];
+    const currentTime = currentCandle ? currentCandle.open_time : Date.now() / 1000;
     slot.fvgs.forEach(z => {
       if(z.mitigated) return;
       const inZone = price <= z.top && price >= z.bottom;
       if(!inZone) return;
-      if(z.type === 'bullish' && slot.bias === 'bullish' && isHigherTfAligned(symbol, tf, 'bullish') && canFire(slot, currentIdx)){
+      if(z.type === 'bullish' && slot.bias === 'bullish' && isHigherTfAligned(symbol, tf, 'bullish') && canFire(slot, currentTime, tf)){
         const htfTxt = tf === '1m' ? ' 5m and 1h both agree bullish.' : tf === '5m' ? ' 1h also agrees bullish.' : '';
         fireSignal(symbol, tf, 'BUY', price, `Price retraced into a bullish FVG (${z.bottom.toFixed(2)}–${z.top.toFixed(2)}) inside an active bullish structure.${htfTxt}`);
-        slot.lastFireIdx = currentIdx;
+        slot.lastFireTime = currentTime;
         z.mitigated = true;
-      } else if(z.type === 'bearish' && slot.bias === 'bearish' && isHigherTfAligned(symbol, tf, 'bearish') && canFire(slot, currentIdx)){
+      } else if(z.type === 'bearish' && slot.bias === 'bearish' && isHigherTfAligned(symbol, tf, 'bearish') && canFire(slot, currentTime, tf)){
         const htfTxt = tf === '1m' ? ' 5m and 1h both agree bearish.' : tf === '5m' ? ' 1h also agrees bearish.' : '';
         fireSignal(symbol, tf, 'SELL', price, `Price retraced into a bearish FVG (${z.bottom.toFixed(2)}–${z.top.toFixed(2)}) inside an active bearish structure.${htfTxt}`);
-        slot.lastFireIdx = currentIdx;
+        slot.lastFireTime = currentTime;
         z.mitigated = true;
       } else if(slot.bias !== 'bullish' && slot.bias !== 'bearish'){
         z.mitigated = true;
@@ -668,9 +697,18 @@
     const xAt = i => leftPad + i * stepX + stepX / 2;
     const yAt = p => topPad + (maxP - p) / (maxP - minP) * chartH;
 
+    function localIdxFromTime(time){
+      for(let i = candles.length - 1; i >= 0; i--){
+        if(candles[i].open_time === time) return i;
+      }
+      return -1;
+    }
+
     slot.fvgs.forEach(z => {
-      const localIdx = z.idx - startIdx;
-      if(localIdx < 0) return;
+      const idx = localIdxFromTime(z.time);
+      if(idx === -1) return;
+      const localIdx = idx - startIdx;
+      if(localIdx < -2) return;
       const x0 = leftPad + Math.max(localIdx - 2, 0) * stepX;
       const x1 = leftPad + chartW;
       const y0 = yAt(z.top), y1 = yAt(z.bottom);
@@ -691,8 +729,13 @@
 
     ctx.font = '700 9px "JetBrains Mono", monospace';
     ctx.textAlign = 'center';
-    slot.events.filter(e => e.idx >= startIdx).forEach(e => {
-      const x = xAt(e.idx - startIdx);
+    let lastLabelX = { up: -999, down: -999 };
+    slot.events.forEach(e => {
+      const idx = localIdxFromTime(e.time);
+      if(idx === -1 || idx < startIdx) return;
+      const x = xAt(idx - startIdx);
+      if(Math.abs(x - lastLabelX[e.dir]) < 22) return;
+      lastLabelX[e.dir] = x;
       ctx.fillStyle = '#EFAA3F';
       ctx.fillText(e.type, x, e.dir === 'up' ? topPad - 5 : h - 2);
     });
