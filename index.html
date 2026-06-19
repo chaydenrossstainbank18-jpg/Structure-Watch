@@ -788,11 +788,13 @@
       const side = sp.dir === 'up' ? 'BUY' : 'SELL';
       const safety = safeToFire(slot, side);
       if(!safety.ok) return;
+      const inOTE = slot.ote && slot.ote.type === dirBias &&
+        currentPrice <= slot.ote.top && currentPrice >= slot.ote.bottom;
       const brokenLevel = dirBias === 'bullish' ? slot.lastSwingHigh : slot.lastSwingLow;
       const levelTxt = brokenLevel ? ` Price closed through the prior swing at ${brokenLevel.price.toFixed(2)}.` : '';
-      const htfTxt = tf === '1m' ? ' 5m and 1h are both confirming the same direction.'
-        : tf === '5m' ? ' 1h is also confirming the same direction.' : '';
-      const oteTxt = inOTE ? ' Entry is inside the OTE golden pocket (62–79% retrace) — high-precision zone.' : '';
+      const htfTxt = tf === '1m' ? ' 5m and 1h not opposing.'
+        : tf === '5m' ? ' 1h not opposing.' : '';
+      const oteTxt = inOTE ? ' ✦ Inside OTE golden pocket — high-precision entry.' : '';
       fireSignal(symbol, tf, side, currentPrice,
         `Strat ${sp.pattern} triggered ${dirBias}.${levelTxt}${oteTxt}${htfTxt}`);
       slot.lastFireTime = currentTime;
@@ -800,8 +802,19 @@
   }
 
   function isHigherTfAligned(symbol, tf, dirBias){
-    if(tf === '1m') return state[symbol]['5m'].bias === dirBias && state[symbol]['1h'].bias === dirBias;
-    if(tf === '5m') return state[symbol]['1h'].bias === dirBias;
+    const opposite = dirBias === 'bullish' ? 'bearish' : 'bullish';
+    if(tf === '1m'){
+      const fiveM = state[symbol]['5m'].bias;
+      const oneH = state[symbol]['1h'].bias;
+      // Block only if 5m or 1h is directly opposite — neutral is allowed
+      if(fiveM === opposite || oneH === opposite) return false;
+      return true;
+    }
+    if(tf === '5m'){
+      const oneH = state[symbol]['1h'].bias;
+      if(oneH === opposite) return false;
+      return true;
+    }
     return true;
   }
 
@@ -823,25 +836,28 @@
       if(!inZone) return;
       if(z.type === 'bullish' && slot.bias === 'bullish' && isHigherTfAligned(symbol, tf, 'bullish') && canFire(slot, currentTime, tf)){
         const inOTE = slot.ote && slot.ote.type === 'bullish' && price <= slot.ote.top && price >= slot.ote.bottom;
-        const htfTxt = tf === '1m' ? ' 5m and 1h both agree bullish.' : tf === '5m' ? ' 1h also agrees bullish.' : '';
-        const oteTxt = inOTE ? ' Price is in the OTE golden pocket (62–79% retrace).' : '';
-        if(inOTE){
-          const safety = safeToFire(slot, 'BUY');
-          if(!safety.ok) return;
+        const htfTxt = tf === '1m' ? ' 5m and 1h not opposing.' : tf === '5m' ? ' 1h not opposing.' : '';
+        const oteTxt = inOTE ? ' ✦ Inside OTE golden pocket — high-precision entry.' : '';
+        const safety = safeToFire(slot, 'BUY');
+        if(safety.ok){
           fireSignal(symbol, tf, 'BUY', price, `Price retraced into a bullish FVG (${z.bottom.toFixed(2)}–${z.top.toFixed(2)}) inside bullish structure.${oteTxt}${htfTxt}`);
           slot.lastFireTime = currentTime;
           z.mitigated = true;
+        } else {
+          z.mitigated = false;
         }
       } else if(z.type === 'bearish' && slot.bias === 'bearish' && isHigherTfAligned(symbol, tf, 'bearish') && canFire(slot, currentTime, tf)){
         const inOTE = slot.ote && slot.ote.type === 'bearish' && price <= slot.ote.top && price >= slot.ote.bottom;
-        const htfTxt = tf === '1m' ? ' 5m and 1h both agree bearish.' : tf === '5m' ? ' 1h also agrees bearish.' : '';
-        if(inOTE){
-          const safety = safeToFire(slot, 'SELL');
-          if(!safety.ok) return;
-          fireSignal(symbol, tf, 'SELL', price, `Price retraced into a bearish FVG (${z.bottom.toFixed(2)}–${z.top.toFixed(2)}) inside bearish structure. Price is in the OTE golden pocket (62–79% retrace).${htfTxt}`);
+        const htfTxt = tf === '1m' ? ' 5m and 1h not opposing.' : tf === '5m' ? ' 1h not opposing.' : '';
+        const oteTxt = inOTE ? ' ✦ Inside OTE golden pocket — high-precision entry.' : '';
+        const safety = safeToFire(slot, 'SELL');
+        if(safety.ok){
+          fireSignal(symbol, tf, 'SELL', price, `Price retraced into a bearish FVG (${z.bottom.toFixed(2)}–${z.top.toFixed(2)}) inside bearish structure.${oteTxt}${htfTxt}`);
           slot.lastFireTime = currentTime;
           z.mitigated = true;
-        } else if(!inOTE){ z.mitigated = false; }
+        } else {
+          z.mitigated = false;
+        }
       } else if(slot.bias !== 'bullish' && slot.bias !== 'bearish'){
         z.mitigated = true;
       } else if((z.type === 'bullish' && slot.bias === 'bearish') || (z.type === 'bearish' && slot.bias === 'bullish')){
