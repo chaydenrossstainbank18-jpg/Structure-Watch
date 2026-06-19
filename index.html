@@ -267,19 +267,7 @@
     <div class="fvg-chips" id="fvg-stpRNG"><div class="fvg-empty">No active FVG zones yet</div></div>
   </div>
 
-  <div class="panel" id="panel-R_25">
-    <div class="panel-head">
-      <div>
-        <div class="sym-name">Volatility 25</div>
-        <div class="sym-tf">R_25</div>
-      </div>
-      <div class="sym-price" id="price-R_25">—</div>
-    </div>
-    <div class="tf-strip" id="strip-R_25"></div>
-    <div class="trigger-line" id="trigger-R_25"></div>
-    <canvas id="chart-R_25"></canvas>
-    <div class="fvg-chips" id="fvg-R_25"><div class="fvg-empty">No active FVG zones yet</div></div>
-  </div>
+
 
   <div class="panel">
     <div class="log-head">Signal Log</div>
@@ -299,13 +287,8 @@
       <div class="perf-stat"><div class="v" id="perfPnl">—</div><div class="l">Total P/L</div></div>
       <div class="perf-stat"><div class="v" id="perfOpen">0 open</div><div class="l">Pending</div></div>
     </div>
-    <div class="risk-row" style="margin-top:14px;">
-      <div class="risk-field">
-        <label for="vix25PtVal">Vol 25: $ per point at 0.1 lot</label>
-        <input type="number" id="vix25PtVal" inputmode="decimal" placeholder="check your contract specs" />
-      </div>
-    </div>
-    <div class="sym-tf" style="margin-top:6px; line-height:1.5;">Tracks what every fired signal would have done if held to its actual SL or TP at 0.1 lot, using Gold = $10/point and Step Index = $1/point (confirmed from real fills). This does not place trades — real results will differ with spread and slippage.</div>
+    <button class="alertBtn" style="margin-top:12px; background:rgba(240,86,111,0.1); color:var(--short); border-color:rgba(240,86,111,0.3);" onclick="clearSavedTrades()">🗑 Clear saved trade history</button>
+    <div class="sym-tf" style="margin-top:6px; line-height:1.5;">Tracks what every fired signal would have done if held to its SL or TP at 0.1 lot. Gold = $10/point, Step Index = $1/point — confirmed from real fills. Signals are saved and persist across sessions. Real results will differ with spread and slippage.</div>
   </div>
 
   <p class="footnote">A signal only fires when a Strat trigger or FVG retest agrees with the structure bias on that timeframe AND the higher timeframe(s) above it. A minimum gap between signals on the same timeframe prevents rapid clustering. The risk reference uses your entered account size and risk % only to estimate a dollar amount — it does not calculate lot size, since point value differs by instrument and broker; confirm that with your contract specs before sizing a position. For alerts to keep working with the screen locked, add this page to your Home Screen via Safari's share menu. This is a rules-based read of price action, not a guarantee or financial advice.</p>
@@ -315,8 +298,7 @@
 <script>
   const SYMBOLS = [
     { code: 'frxXAUUSD', name: 'GOLD' },
-    { code: 'stpRNG', name: 'STEP' },
-    { code: 'R_25', name: 'VIX25' }
+    { code: 'stpRNG', name: 'STEP' }
   ];
   const TIMEFRAMES = [
     { key: '1m', seconds: 60, label: '1M' },
@@ -335,17 +317,32 @@
   const signalLog = [];
 
   // --- Hypothetical 0.1-lot performance tracking ---
-  const pointValue = { frxXAUUSD: 10, stpRNG: 1, R_25: null };
-  const vix25PtValEl = document.getElementById('vix25PtVal');
-  vix25PtValEl.value = localStorage.getItem('sw_ptval_R25') || '';
-  pointValue.R_25 = parseFloat(vix25PtValEl.value) || null;
-  vix25PtValEl.addEventListener('input', () => {
-    pointValue.R_25 = parseFloat(vix25PtValEl.value) || null;
-    localStorage.setItem('sw_ptval_R25', vix25PtValEl.value);
-    signalLog.forEach(s => { if(s.symbol === 'R_25' && s.status !== 'open') recomputePnl(s); });
-    updatePerformancePanel();
-    renderLog();
-  });
+  const pointValue = { frxXAUUSD: 10, stpRNG: 1 };
+
+  // --- Persistent signal log (survives refresh and reconnects) ---
+  window.clearSavedTrades = function(){
+    if(!confirm('Clear all saved trade history? This cannot be undone.')) return;
+    signalLog.length = 0;
+    try{ localStorage.removeItem('sw_signals'); }catch(e){}
+    renderLog(); updatePerformancePanel();
+  };
+
+  function saveSignalLog(){    try{ localStorage.setItem('sw_signals', JSON.stringify(signalLog.map(s => ({ ...s, time: s.time.toISOString() })))); }catch(e){}
+  }
+  function loadSignalLog(){
+    try{
+      const raw = localStorage.getItem('sw_signals');
+      if(!raw) return;
+      const parsed = JSON.parse(raw);
+      parsed.forEach(s => {
+        s.time = new Date(s.time);
+        if(!s.quality) s.quality = { warn: false, text: 'Loaded from saved history.' };
+        if(!s.goldPlan) s.goldPlan = null;
+        signalLog.push(s);
+      });
+    }catch(e){}
+  }
+  loadSignalLog();
 
   function recomputePnl(s){
     const ptVal = pointValue[s.symbol];
@@ -365,7 +362,7 @@
         else if(price >= s.sl){ resolveSignal(s, 'loss', s.sl); changed = true; }
       }
     });
-    if(changed){ updatePerformancePanel(); renderLog(); }
+    if(changed){ updatePerformancePanel(); renderLog(); saveSignalLog(); }
   }
 
   function resolveSignal(s, outcome, exitPrice){
@@ -688,6 +685,21 @@
       if(slot.fvgs.length > 25) slot.fvgs.shift();
     }
     slot.recentSwings = swings;
+
+    // --- OTE: Optimal Trade Entry (Fibonacci 62%–79% golden pocket) ---
+    if(lastSwingHigh && lastSwingLow){
+      const swingH = lastSwingHigh.price;
+      const swingL = lastSwingLow.price;
+      if(slot.bias === 'bullish'){
+        slot.ote = { top: swingL + (swingH - swingL) * 0.38, bottom: swingL + (swingH - swingL) * 0.21, type: 'bullish' };
+      } else if(slot.bias === 'bearish'){
+        slot.ote = { top: swingH - (swingH - swingL) * 0.21, bottom: swingH - (swingH - swingL) * 0.38, type: 'bearish' };
+      } else {
+        slot.ote = null;
+      }
+    } else {
+      slot.ote = null;
+    }
   }
 
   function evaluateStratTrigger(symbol, tf){
@@ -704,14 +716,18 @@
     const strongBody = range > 0 && (body / range) >= 0.4;
     const htfAligned = isHigherTfAligned(symbol, tf, dirBias);
     const currentTime = triggerCandle.open_time;
+    const currentPrice = triggerCandle.close;
+    const inOTE = slot.ote && slot.ote.type === dirBias &&
+      currentPrice <= slot.ote.top && currentPrice >= slot.ote.bottom;
     if(slot.bias === dirBias && strongBody && htfAligned && canFire(slot, currentTime, tf)){
       const side = sp.dir === 'up' ? 'BUY' : 'SELL';
       const brokenLevel = dirBias === 'bullish' ? slot.lastSwingHigh : slot.lastSwingLow;
       const levelTxt = brokenLevel ? ` Price closed through the prior swing at ${brokenLevel.price.toFixed(2)}.` : '';
       const htfTxt = tf === '1m' ? ' 5m and 1h are both confirming the same direction.'
         : tf === '5m' ? ' 1h is also confirming the same direction.' : '';
-      fireSignal(symbol, tf, side, triggerCandle.close,
-        `Strat ${sp.pattern} triggered ${dirBias}.${levelTxt}${htfTxt}`);
+      const oteTxt = inOTE ? ' Entry is inside the OTE golden pocket (62–79% retrace) — high-precision zone.' : '';
+      fireSignal(symbol, tf, side, currentPrice,
+        `Strat ${sp.pattern} triggered ${dirBias}.${levelTxt}${oteTxt}${htfTxt}`);
       slot.lastFireTime = currentTime;
     }
   }
@@ -739,15 +755,22 @@
       const inZone = price <= z.top && price >= z.bottom;
       if(!inZone) return;
       if(z.type === 'bullish' && slot.bias === 'bullish' && isHigherTfAligned(symbol, tf, 'bullish') && canFire(slot, currentTime, tf)){
+        const inOTE = slot.ote && slot.ote.type === 'bullish' && price <= slot.ote.top && price >= slot.ote.bottom;
         const htfTxt = tf === '1m' ? ' 5m and 1h both agree bullish.' : tf === '5m' ? ' 1h also agrees bullish.' : '';
-        fireSignal(symbol, tf, 'BUY', price, `Price retraced into a bullish FVG (${z.bottom.toFixed(2)}–${z.top.toFixed(2)}) inside an active bullish structure.${htfTxt}`);
-        slot.lastFireTime = currentTime;
-        z.mitigated = true;
+        const oteTxt = inOTE ? ' Price is in the OTE golden pocket (62–79% retrace).' : '';
+        if(inOTE){
+          fireSignal(symbol, tf, 'BUY', price, `Price retraced into a bullish FVG (${z.bottom.toFixed(2)}–${z.top.toFixed(2)}) inside bullish structure.${oteTxt}${htfTxt}`);
+          slot.lastFireTime = currentTime;
+          z.mitigated = true;
+        }
       } else if(z.type === 'bearish' && slot.bias === 'bearish' && isHigherTfAligned(symbol, tf, 'bearish') && canFire(slot, currentTime, tf)){
+        const inOTE = slot.ote && slot.ote.type === 'bearish' && price <= slot.ote.top && price >= slot.ote.bottom;
         const htfTxt = tf === '1m' ? ' 5m and 1h both agree bearish.' : tf === '5m' ? ' 1h also agrees bearish.' : '';
-        fireSignal(symbol, tf, 'SELL', price, `Price retraced into a bearish FVG (${z.bottom.toFixed(2)}–${z.top.toFixed(2)}) inside an active bearish structure.${htfTxt}`);
-        slot.lastFireTime = currentTime;
-        z.mitigated = true;
+        if(inOTE){
+          fireSignal(symbol, tf, 'SELL', price, `Price retraced into a bearish FVG (${z.bottom.toFixed(2)}–${z.top.toFixed(2)}) inside bearish structure. Price is in the OTE golden pocket (62–79% retrace).${htfTxt}`);
+          slot.lastFireTime = currentTime;
+          z.mitigated = true;
+        } else if(!inOTE){ z.mitigated = false; }
       } else if(slot.bias !== 'bullish' && slot.bias !== 'bearish'){
         z.mitigated = true;
       } else if((z.type === 'bullish' && slot.bias === 'bearish') || (z.type === 'bearish' && slot.bias === 'bullish')){
@@ -799,6 +822,7 @@
     if(signalLog.length > 50) signalLog.pop();
     renderLog();
     updatePerformancePanel();
+    saveSignalLog();
     bumpDailyCount();
     const sym = SYMBOLS.find(x => x.code === symbol);
     notify(`${side} ${sym ? sym.name : symbol} · ${tf}`, reason);
@@ -871,7 +895,13 @@
     const triggerEl = document.getElementById('trigger-' + symbol);
     if(activeSlot.lastStrat){
       const arrow = activeSlot.lastStrat.dir === 'up' ? '▲' : '▼';
-      triggerEl.textContent = `${TIMEFRAMES.find(t=>t.key===sym.activeTf).label} trigger: ${activeSlot.lastStrat.pattern} ${arrow}`;
+      let txt = `${TIMEFRAMES.find(t=>t.key===sym.activeTf).label} trigger: ${activeSlot.lastStrat.pattern} ${arrow}`;
+      if(activeSlot.ote){
+        txt += `  ·  OTE ${activeSlot.ote.bottom.toFixed(2)}–${activeSlot.ote.top.toFixed(2)}`;
+      }
+      triggerEl.textContent = txt;
+    } else if(activeSlot.ote){
+      triggerEl.textContent = `OTE golden pocket: ${activeSlot.ote.bottom.toFixed(2)}–${activeSlot.ote.top.toFixed(2)}`;
     } else {
       triggerEl.textContent = '';
     }
@@ -909,6 +939,18 @@
     const stepX = chartW / visible.length;
     const xAt = i => leftPad + i * stepX + stepX / 2;
     const yAt = p => topPad + (maxP - p) / (maxP - minP) * chartH;
+
+    if(slot.ote){
+      const y0 = yAt(slot.ote.top), y1 = yAt(slot.ote.bottom);
+      ctx.fillStyle = 'rgba(239,170,63,0.07)';
+      ctx.fillRect(leftPad, Math.min(y0,y1), chartW, Math.abs(y1-y0));
+      ctx.strokeStyle = 'rgba(239,170,63,0.25)';
+      ctx.lineWidth = 0.8;
+      ctx.setLineDash([3,3]);
+      ctx.beginPath(); ctx.moveTo(leftPad, Math.min(y0,y1)); ctx.lineTo(leftPad+chartW, Math.min(y0,y1)); ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(leftPad, Math.max(y0,y1)); ctx.lineTo(leftPad+chartW, Math.max(y0,y1)); ctx.stroke();
+      ctx.setLineDash([]);
+    }
 
     function localIdxFromTime(time){
       for(let i = candles.length - 1; i >= 0; i--){
