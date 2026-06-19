@@ -702,6 +702,71 @@
     }
   }
 
+  // --- MACD (12,26,9) from candle closes — same settings as your MT5 chart ---
+  function calcMACD(candles){
+    const closes = candles.map(c => c.close);
+    if(closes.length < 35) return null;
+    function ema(data, period){
+      const k = 2 / (period + 1);
+      let val = data[0];
+      for(let i = 1; i < data.length; i++) val = data[i] * k + val * (1 - k);
+      return val;
+    }
+    function emaArr(data, period){
+      const k = 2 / (period + 1);
+      const result = [data[0]];
+      for(let i = 1; i < data.length; i++) result.push(data[i] * k + result[i-1] * (1 - k));
+      return result;
+    }
+    const ema12 = emaArr(closes, 12);
+    const ema26 = emaArr(closes, 26);
+    const macdLine = ema12.map((v, i) => v - ema26[i]).slice(25);
+    const signal = emaArr(macdLine, 9);
+    const last = macdLine[macdLine.length - 1];
+    const lastSig = signal[signal.length - 1];
+    const prev = macdLine[macdLine.length - 2];
+    const prevSig = signal[signal.length - 2];
+    return {
+      macd: last, signal: lastSig, hist: last - lastSig,
+      bullish: last > lastSig,
+      crossingUp: prev < prevSig && last > lastSig,
+      crossingDown: prev > prevSig && last < lastSig
+    };
+  }
+
+  // --- Momentum & impulse safety checks ---
+  function safeToFire(slot, side){
+    const c = slot.candles;
+    if(c.length < 6) return { ok: true, reason: '' };
+
+    // 1. Consecutive candle momentum — if last 3 closed candles all go the same way, block opposite
+    const recent = c.slice(-4, -1);
+    const allBull = recent.every(x => x.close > x.open);
+    const allBear = recent.every(x => x.close < x.open);
+    if(side === 'SELL' && allBull) return { ok: false, reason: 'Blocked: 3 consecutive bullish closes — momentum is against this sell.' };
+    if(side === 'BUY' && allBear) return { ok: false, reason: 'Blocked: 3 consecutive bearish closes — momentum is against this buy.' };
+
+    // 2. Impulse spike — if the most recent closed candle is >2.5x the avg recent range, block counter-direction
+    const ranges = c.slice(-15, -1).map(x => x.high - x.low);
+    const avgRange = ranges.length ? ranges.reduce((a,b) => a+b, 0) / ranges.length : 0;
+    const lastClosed = c[c.length - 2];
+    const lastRange = lastClosed.high - lastClosed.low;
+    if(avgRange > 0 && lastRange > avgRange * 2.5){
+      const spikeDir = lastClosed.close > lastClosed.open ? 'bull' : 'bear';
+      if(side === 'SELL' && spikeDir === 'bull') return { ok: false, reason: 'Blocked: impulse bullish spike — selling into momentum is too risky.' };
+      if(side === 'BUY' && spikeDir === 'bear') return { ok: false, reason: 'Blocked: impulse bearish spike — buying into momentum is too risky.' };
+    }
+
+    // 3. MACD direction — must agree with trade direction
+    const macd = calcMACD(c);
+    if(macd){
+      if(side === 'SELL' && macd.bullish) return { ok: false, reason: 'Blocked: MACD is above signal line (bullish) — no sells while momentum is up.' };
+      if(side === 'BUY' && !macd.bullish) return { ok: false, reason: 'Blocked: MACD is below signal line (bearish) — no buys while momentum is down.' };
+    }
+
+    return { ok: true, reason: '' };
+  }
+
   function evaluateStratTrigger(symbol, tf){
     const slot = state[symbol][tf];
     const c = slot.candles;
@@ -721,6 +786,8 @@
       currentPrice <= slot.ote.top && currentPrice >= slot.ote.bottom;
     if(slot.bias === dirBias && strongBody && htfAligned && canFire(slot, currentTime, tf)){
       const side = sp.dir === 'up' ? 'BUY' : 'SELL';
+      const safety = safeToFire(slot, side);
+      if(!safety.ok) return;
       const brokenLevel = dirBias === 'bullish' ? slot.lastSwingHigh : slot.lastSwingLow;
       const levelTxt = brokenLevel ? ` Price closed through the prior swing at ${brokenLevel.price.toFixed(2)}.` : '';
       const htfTxt = tf === '1m' ? ' 5m and 1h are both confirming the same direction.'
@@ -759,6 +826,8 @@
         const htfTxt = tf === '1m' ? ' 5m and 1h both agree bullish.' : tf === '5m' ? ' 1h also agrees bullish.' : '';
         const oteTxt = inOTE ? ' Price is in the OTE golden pocket (62–79% retrace).' : '';
         if(inOTE){
+          const safety = safeToFire(slot, 'BUY');
+          if(!safety.ok) return;
           fireSignal(symbol, tf, 'BUY', price, `Price retraced into a bullish FVG (${z.bottom.toFixed(2)}–${z.top.toFixed(2)}) inside bullish structure.${oteTxt}${htfTxt}`);
           slot.lastFireTime = currentTime;
           z.mitigated = true;
@@ -767,6 +836,8 @@
         const inOTE = slot.ote && slot.ote.type === 'bearish' && price <= slot.ote.top && price >= slot.ote.bottom;
         const htfTxt = tf === '1m' ? ' 5m and 1h both agree bearish.' : tf === '5m' ? ' 1h also agrees bearish.' : '';
         if(inOTE){
+          const safety = safeToFire(slot, 'SELL');
+          if(!safety.ok) return;
           fireSignal(symbol, tf, 'SELL', price, `Price retraced into a bearish FVG (${z.bottom.toFixed(2)}–${z.top.toFixed(2)}) inside bearish structure. Price is in the OTE golden pocket (62–79% retrace).${htfTxt}`);
           slot.lastFireTime = currentTime;
           z.mitigated = true;
