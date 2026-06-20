@@ -52,6 +52,8 @@
     margin: 0; letter-spacing: -0.015em;
   }
   .status{ display:flex; align-items:center; gap:7px; font-family:'JetBrains Mono', monospace; font-size: 11px; color: var(--mute); margin-top: 8px; justify-content:flex-end; }
+  .session-badge{ font-family:'JetBrains Mono', monospace; font-size: 10px; color: var(--faint); text-align:right; margin-top: 4px; }
+  .session-badge.active{ color: var(--long); }
   .dot{ width:7px; height:7px; border-radius:50%; background: var(--mute); flex-shrink:0; }
   .dot.live{ background: var(--long); animation: pulse 1.8s ease-in-out infinite; }
   .dot.err{ background: var(--short); }
@@ -146,6 +148,8 @@
   .alertBtn.on{ background: rgba(63,224,160,0.18); }
   .log-why{ color: var(--ink); grid-column: 1 / -1; font-size: 10.5px; margin-top: 2px; line-height:1.45; }
   .log-risk-amt{ color: var(--faint); }
+  .log-confluence{ grid-column: 1 / -1; font-size: 13px; color: var(--signal); letter-spacing: 0.05em; margin-top: 2px; }
+  .log-confluence span{ font-family:'JetBrains Mono', monospace; font-size: 9.5px; color: var(--mute); text-transform: uppercase; margin-left: 4px; }
   .log-quality{ grid-column: 1 / -1; font-size: 10.5px; margin-top: 4px; line-height: 1.4; padding-top: 6px; border-top: 1px dashed var(--hairline); }
   .log-quality.ok{ color: var(--long); }
   .log-quality.warn{ color: var(--signal); }
@@ -214,7 +218,10 @@
       <p class="eyebrow">Deriv · 1m / 5m / 1h · Strat + ICT</p>
       <h1>Structure Watch</h1>
     </div>
-    <div class="status"><span class="dot" id="statusDot"></span><span id="statusText">Connecting…</span></div>
+    <div>
+      <div class="status"><span class="dot" id="statusDot"></span><span id="statusText">Connecting…</span></div>
+      <div class="session-badge" id="sessionBadge"></div>
+    </div>
   </div>
 
   <div class="panel" id="riskPanel">
@@ -235,6 +242,13 @@
         <input type="number" id="riskPct" inputmode="decimal" value="1" step="0.5" />
       </div>
     </div>
+    <div class="risk-row">
+      <div class="risk-field">
+        <label for="dailyLossLimit">Daily loss limit (USD, optional)</label>
+        <input type="number" id="dailyLossLimit" inputmode="decimal" placeholder="e.g. 50" />
+      </div>
+    </div>
+    <div id="dailyLossStatus" class="sym-tf" style="margin-bottom:10px;">Today's simulated P/L: $0.00</div>
     <button class="alertBtn" id="alertBtn" onclick="enableAlerts()">🔔 Enable sound + notification alerts</button>
     <div id="alertStatus" class="sym-tf" style="margin-top:8px;">Alerts off — tap to enable. For alerts to work when the screen is locked, add this page to your Home Screen first.</div>
   </div>
@@ -287,6 +301,7 @@
       <div class="perf-stat"><div class="v" id="perfPnl">—</div><div class="l">Total P/L</div></div>
       <div class="perf-stat"><div class="v" id="perfOpen">0 open</div><div class="l">Pending</div></div>
     </div>
+    <canvas id="equityCurve" style="width:100%; height:90px; display:block; border-radius:8px; background:#0B0F15; margin-top:12px;"></canvas>
     <button class="alertBtn" style="margin-top:12px; background:rgba(240,86,111,0.1); color:var(--short); border-color:rgba(240,86,111,0.3);" onclick="clearSavedTrades()">🗑 Clear saved trade history</button>
     <div class="sym-tf" style="margin-top:6px; line-height:1.5;">Tracks what every fired signal would have done if held to its SL or TP at 0.1 lot. Gold = $10/point, Step Index = $1/point — confirmed from real fills. Signals are saved and persist across sessions. Real results will differ with spread and slippage.</div>
   </div>
@@ -338,6 +353,10 @@
         s.time = new Date(s.time);
         if(!s.quality) s.quality = { warn: false, text: 'Loaded from saved history.' };
         if(!s.goldPlan) s.goldPlan = null;
+        if(s.confluence === undefined) s.confluence = null;
+        if(s.partialTp === undefined) s.partialTp = null;
+        if(s.beHit === undefined) s.beHit = false;
+        if(s.partialHit === undefined) s.partialHit = false;
         signalLog.push(s);
       });
     }catch(e){}
@@ -354,6 +373,30 @@
     let changed = false;
     signalLog.forEach(s => {
       if(s.symbol !== symbol || s.status !== 'open') return;
+
+      // Break-even nudge: once price reaches 1:1, flag it (display only — does not move the SL automatically)
+      if(!s.beHit){
+        const oneToOne = s.side === 'BUY' ? s.price + (s.price - s.sl) : s.price - (s.sl - s.price);
+        const reached = s.side === 'BUY' ? price >= oneToOne : price <= oneToOne;
+        if(reached){
+          s.beHit = true;
+          changed = true;
+          const sym = SYMBOLS.find(x => x.code === s.symbol);
+          notify(`Break-even: ${s.side} ${sym ? sym.name : s.symbol} · ${s.tf}`, `Price hit 1:1 — consider moving SL to entry (${s.price.toFixed(2)}) and trailing the rest.`);
+        }
+      }
+
+      // Partial TP at 1:1 (50%), full close at the original 1:3 TP
+      if(!s.partialHit){
+        const partialLevel = s.side === 'BUY' ? s.price + (s.price - s.sl) : s.price - (s.sl - s.price);
+        const reachedPartial = s.side === 'BUY' ? price >= partialLevel : price <= partialLevel;
+        if(reachedPartial){
+          s.partialHit = true;
+          s.partialPrice = partialLevel;
+          changed = true;
+        }
+      }
+
       if(s.side === 'BUY'){
         if(price >= s.tp){ resolveSignal(s, 'win', s.tp); changed = true; }
         else if(price <= s.sl){ resolveSignal(s, 'loss', s.sl); changed = true; }
@@ -369,6 +412,31 @@
     s.status = outcome;
     s.exitPrice = exitPrice;
     recomputePnl(s);
+    updateDailyPnl();
+  }
+
+  // --- Daily loss limit ---
+  function updateDailyPnl(){
+    const key = todayKey();
+    const todays = signalLog.filter(s => (s.status === 'win' || s.status === 'loss') && s.time.toISOString().slice(0,10) === key && s.pnl != null);
+    dailyPnl = todays.reduce((sum, s) => sum + s.pnl, 0);
+    const limitEl = document.getElementById('dailyLossStatus');
+    if(limitEl){
+      const limit = parseFloat(dailyLossLimitEl.value);
+      if(limit && limit > 0 && dailyPnl <= -Math.abs(limit)){
+        limitEl.textContent = `⛔ Daily loss limit hit (${dailyPnl.toFixed(2)} / -${limit}) — new signals are paused until tomorrow.`;
+        limitEl.style.color = 'var(--short)';
+      } else {
+        limitEl.textContent = `Today's simulated P/L: ${dailyPnl >= 0 ? '+' : ''}$${dailyPnl.toFixed(2)}`;
+        limitEl.style.color = '';
+      }
+    }
+  }
+
+  function dailyLossLimitReached(){
+    const limit = parseFloat(dailyLossLimitEl.value);
+    if(!limit || limit <= 0) return false;
+    return dailyPnl <= -Math.abs(limit);
   }
 
   function updatePerformancePanel(){
@@ -380,6 +448,48 @@
     document.getElementById('perfWinRate').textContent = total ? `${(wins / total * 100).toFixed(0)}% (${wins}/${total})` : '—';
     document.getElementById('perfPnl').textContent = knownPnl.length ? `$${totalPnl.toFixed(2)}` : '—';
     document.getElementById('perfOpen').textContent = signalLog.filter(s => s.status === 'open').length + ' open';
+    updateDailyPnl();
+    drawEquityCurve();
+  }
+
+  function drawEquityCurve(){
+    const canvas = document.getElementById('equityCurve');
+    if(!canvas) return;
+    const dpr = window.devicePixelRatio || 1;
+    const w = canvas.clientWidth, h = canvas.clientHeight;
+    if(w === 0 || h === 0) return;
+    canvas.width = w * dpr; canvas.height = h * dpr;
+    const ctx = canvas.getContext('2d');
+    ctx.scale(dpr, dpr);
+    ctx.clearRect(0, 0, w, h);
+
+    const resolved = signalLog.filter(s => (s.status === 'win' || s.status === 'loss') && s.pnl != null)
+      .sort((a, b) => a.time - b.time);
+    if(resolved.length < 2){
+      ctx.fillStyle = '#4A5363';
+      ctx.font = '11px "JetBrains Mono", monospace';
+      ctx.textAlign = 'center';
+      ctx.fillText('Not enough resolved trades yet', w/2, h/2);
+      return;
+    }
+    let running = 0;
+    const points = [0];
+    resolved.forEach(s => { running += s.pnl; points.push(running); });
+    const minP = Math.min(...points), maxP = Math.max(...points);
+    const pad = (maxP - minP) * 0.15 || 5;
+    const top = maxP + pad, bottom = minP - pad;
+    const stepX = w / (points.length - 1);
+    const yAt = v => h - ((v - bottom) / (top - bottom)) * h;
+
+    ctx.strokeStyle = 'rgba(255,255,255,0.08)';
+    ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(0, yAt(0)); ctx.lineTo(w, yAt(0)); ctx.stroke();
+
+    ctx.strokeStyle = running >= 0 ? '#3FE0A0' : '#F0566F';
+    ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    points.forEach((v, i) => { const x = i * stepX, y = yAt(v); if(i === 0) ctx.moveTo(x,y); else ctx.lineTo(x,y); });
+    ctx.stroke();
   }
 
   // --- Rules-based trade quality check (not a live AI call — see note in chat) ---
@@ -421,13 +531,59 @@
     return { warn, text: notes.join(' ') };
   }
 
-  // --- Account, risk, alerts, daily counter ---
+  // --- Trading session detection (Gold behaves differently by session; times in UTC) ---
+  function currentSession(){
+    const h = new Date().getUTCHours();
+    if(h >= 6 && h < 9) return { name: 'London Open', active: true, note: 'high-quality window' };
+    if(h >= 9 && h < 16) return { name: 'London/NY overlap', active: true, note: 'high-quality window' };
+    if(h >= 16 && h < 21) return { name: 'New York', active: true, note: 'good liquidity' };
+    if(h >= 0 && h < 6) return { name: 'Asian session', active: false, note: 'thinner liquidity, lower conviction' };
+    return { name: 'Late NY / pre-Asian', active: false, note: 'thinner liquidity, lower conviction' };
+  }
+
+  // --- Liquidity sweep detector: spike beyond a prior swing that immediately reverses ---
+  function detectLiquiditySweep(slot){
+    const c = slot.candles;
+    if(c.length < 8) return null;
+    const trigger = c[c.length - 2];
+    const confirm = c[c.length - 1];
+    const swings = slot.recentSwings || [];
+    const priorHighs = swings.filter(s => s.type === 'high');
+    const priorLows = swings.filter(s => s.type === 'low');
+    const nearestHigh = priorHighs.length ? priorHighs[priorHighs.length - 1] : null;
+    const nearestLow = priorLows.length ? priorLows[priorLows.length - 1] : null;
+
+    if(nearestHigh && trigger.high > nearestHigh.price && trigger.close < nearestHigh.price && confirm.close < trigger.low){
+      return { dir: 'down', level: nearestHigh.price, type: 'sell-side sweep above prior high' };
+    }
+    if(nearestLow && trigger.low < nearestLow.price && trigger.close > nearestLow.price && confirm.close > trigger.high){
+      return { dir: 'up', level: nearestLow.price, type: 'buy-side sweep below prior low' };
+    }
+    return null;
+  }
+
+  // --- Confluence scoring: how many independent conditions support this entry ---
+  function scoreConfluence({ structureOk, htfOk, inOTE, macdAgrees, freshImpulseFvg, sweepConfirmed, goodSession }){
+    let score = 0;
+    if(structureOk) score++;
+    if(htfOk) score++;
+    if(inOTE) score++;
+    if(macdAgrees) score++;
+    if(freshImpulseFvg) score++;
+    if(sweepConfirmed) score++;
+    if(goodSession) score++;
+    return Math.min(5, Math.max(1, Math.round(score * 5 / 7)));
+  }
   const acctBalanceEl = document.getElementById('acctBalance');
   const riskPctEl = document.getElementById('riskPct');
+  const dailyLossLimitEl = document.getElementById('dailyLossLimit');
+  let dailyPnl = 0;
   acctBalanceEl.value = localStorage.getItem('sw_balance') || '';
   riskPctEl.value = localStorage.getItem('sw_riskPct') || '1';
+  dailyLossLimitEl.value = localStorage.getItem('sw_dailyLossLimit') || '';
   acctBalanceEl.addEventListener('input', () => localStorage.setItem('sw_balance', acctBalanceEl.value));
   riskPctEl.addEventListener('input', () => localStorage.setItem('sw_riskPct', riskPctEl.value));
+  dailyLossLimitEl.addEventListener('input', () => { localStorage.setItem('sw_dailyLossLimit', dailyLossLimitEl.value); updateDailyPnl(); });
 
   function todayKey(){ return new Date().toISOString().slice(0, 10); }
   let dailyCount = (localStorage.getItem('sw_countDate') === todayKey()) ? (+localStorage.getItem('sw_count') || 0) : 0;
@@ -677,10 +833,16 @@
     const n = c.length;
     if(n >= 3){
       const a = c[n-3], b = c[n-1];
-      if(a.high < b.low){
-        slot.fvgs.push({ type: 'bullish', top: b.low, bottom: a.high, time: lastTime, mitigated: false });
-      } else if(a.low > b.high){
-        slot.fvgs.push({ type: 'bearish', top: a.low, bottom: b.high, time: lastTime, mitigated: false });
+      const middle = c[n-2];
+      const middleRange = middle.high - middle.low;
+      const middleBody = Math.abs(middle.close - middle.open);
+      const impulse = middleRange > 0 && (middleBody / middleRange) >= 0.50;
+      if(impulse){
+        if(a.high < b.low){
+          slot.fvgs.push({ type: 'bullish', top: b.low, bottom: a.high, time: lastTime, mitigated: false });
+        } else if(a.low > b.high){
+          slot.fvgs.push({ type: 'bearish', top: a.low, bottom: b.high, time: lastTime, mitigated: false });
+        }
       }
       if(slot.fvgs.length > 25) slot.fvgs.shift();
     }
@@ -772,33 +934,63 @@
     const c = slot.candles;
     if(c.length < 3) return;
     const sp = detectStratPattern(slot.types.filter(t => t !== null));
-    if(!sp) return;
-    slot.lastStrat = { pattern: sp.pattern, dir: sp.dir, time: new Date() };
-    const dirBias = sp.dir === 'up' ? 'bullish' : 'bearish';
-    const triggerCandle = c[c.length - 1];
-    const range = triggerCandle.high - triggerCandle.low;
-    const body = Math.abs(triggerCandle.close - triggerCandle.open);
-    const strongBody = range > 0 && (body / range) >= 0.4;
-    const htfAligned = isHigherTfAligned(symbol, tf, dirBias);
-    const currentTime = triggerCandle.open_time;
-    const currentPrice = triggerCandle.close;
-    const inOTE = slot.ote && slot.ote.type === dirBias &&
-      currentPrice <= slot.ote.top && currentPrice >= slot.ote.bottom;
-    if(slot.bias === dirBias && strongBody && htfAligned && canFire(slot, currentTime, tf)){
-      const side = sp.dir === 'up' ? 'BUY' : 'SELL';
-      const safety = safeToFire(slot, side);
-      if(!safety.ok) return;
+    if(sp){
+      slot.lastStrat = { pattern: sp.pattern, dir: sp.dir, time: new Date() };
+      const dirBias = sp.dir === 'up' ? 'bullish' : 'bearish';
+      const triggerCandle = c[c.length - 1];
+      const range = triggerCandle.high - triggerCandle.low;
+      const body = Math.abs(triggerCandle.close - triggerCandle.open);
+      const strongBody = range > 0 && (body / range) >= 0.4;
+      const htfAligned = isHigherTfAligned(symbol, tf, dirBias);
+      const currentTime = triggerCandle.open_time;
+      const currentPrice = triggerCandle.close;
       const inOTE = slot.ote && slot.ote.type === dirBias &&
         currentPrice <= slot.ote.top && currentPrice >= slot.ote.bottom;
-      const brokenLevel = dirBias === 'bullish' ? slot.lastSwingHigh : slot.lastSwingLow;
-      const levelTxt = brokenLevel ? ` Price closed through the prior swing at ${brokenLevel.price.toFixed(2)}.` : '';
-      const htfTxt = tf === '1m' ? ' 5m and 1h not opposing.'
-        : tf === '5m' ? ' 1h not opposing.' : '';
-      const oteTxt = inOTE ? ' ✦ Inside OTE golden pocket — high-precision entry.' : '';
-      fireSignal(symbol, tf, side, currentPrice,
-        `Strat ${sp.pattern} triggered ${dirBias}.${levelTxt}${oteTxt}${htfTxt}`);
-      slot.lastFireTime = currentTime;
+      if(slot.bias === dirBias && strongBody && htfAligned && canFire(slot, currentTime, tf)){
+        const side = sp.dir === 'up' ? 'BUY' : 'SELL';
+        const safety = safeToFire(slot, side);
+        if(safety.ok){
+          const brokenLevel = dirBias === 'bullish' ? slot.lastSwingHigh : slot.lastSwingLow;
+          const levelTxt = brokenLevel ? ` Price closed through the prior swing at ${brokenLevel.price.toFixed(2)}.` : '';
+          const htfTxt = tf === '1m' ? ' 5m and 1h not opposing.'
+            : tf === '5m' ? ' 1h not opposing.' : '';
+          const oteTxt = inOTE ? ' ✦ Inside OTE golden pocket — high-precision entry.' : '';
+          const macd = calcMACD(c);
+          const session = currentSession();
+          fireSignal(symbol, tf, side, currentPrice,
+            `Strat ${sp.pattern} triggered ${dirBias}.${levelTxt}${oteTxt}${htfTxt}`,
+            { structureOk: true, htfOk: htfAligned, inOTE: !!inOTE, macdAgrees: macd ? (side === 'BUY' ? macd.bullish : !macd.bullish) : false, freshImpulseFvg: false, sweepConfirmed: false, goodSession: session.active });
+          slot.lastFireTime = currentTime;
+        }
+      }
     }
+    evaluateLiquiditySweep(symbol, tf);
+  }
+
+  function evaluateLiquiditySweep(symbol, tf){
+    const slot = state[symbol][tf];
+    const c = slot.candles;
+    if(c.length < 8) return;
+    const sweep = detectLiquiditySweep(slot);
+    if(!sweep) return;
+    const dirBias = sweep.dir === 'up' ? 'bullish' : 'bearish';
+    const side = sweep.dir === 'up' ? 'BUY' : 'SELL';
+    const currentTime = c[c.length - 1].open_time;
+    const currentPrice = c[c.length - 1].close;
+    const htfAligned = isHigherTfAligned(symbol, tf, dirBias);
+    if(!htfAligned || !canFire(slot, currentTime, tf)) return;
+    const safety = safeToFire(slot, side);
+    if(!safety.ok) return;
+    const inOTE = slot.ote && slot.ote.type === dirBias &&
+      currentPrice <= slot.ote.top && currentPrice >= slot.ote.bottom;
+    const htfTxt = tf === '1m' ? ' 5m and 1h not opposing.' : tf === '5m' ? ' 1h not opposing.' : '';
+    const oteTxt = inOTE ? ' ✦ Inside OTE golden pocket.' : '';
+    const macd = calcMACD(c);
+    const session = currentSession();
+    fireSignal(symbol, tf, side, currentPrice,
+      `Liquidity sweep: ${sweep.type} at ${sweep.level.toFixed(2)}, price reversed immediately.${oteTxt}${htfTxt}`,
+      { structureOk: true, htfOk: htfAligned, inOTE: !!inOTE, macdAgrees: macd ? (side === 'BUY' ? macd.bullish : !macd.bullish) : false, freshImpulseFvg: false, sweepConfirmed: true, goodSession: session.active });
+    slot.lastFireTime = currentTime;
   }
 
   function isHigherTfAligned(symbol, tf, dirBias){
@@ -840,7 +1032,10 @@
         const oteTxt = inOTE ? ' ✦ Inside OTE golden pocket — high-precision entry.' : '';
         const safety = safeToFire(slot, 'BUY');
         if(safety.ok){
-          fireSignal(symbol, tf, 'BUY', price, `Price retraced into a bullish FVG (${z.bottom.toFixed(2)}–${z.top.toFixed(2)}) inside bullish structure.${oteTxt}${htfTxt}`);
+          const macd = calcMACD(slot.candles);
+          const session = currentSession();
+          fireSignal(symbol, tf, 'BUY', price, `Price retraced into a bullish FVG (${z.bottom.toFixed(2)}–${z.top.toFixed(2)}) inside bullish structure.${oteTxt}${htfTxt}`,
+            { structureOk: true, htfOk: true, inOTE: !!inOTE, macdAgrees: macd ? macd.bullish : false, freshImpulseFvg: true, sweepConfirmed: false, goodSession: session.active });
           slot.lastFireTime = currentTime;
           z.mitigated = true;
         } else {
@@ -852,7 +1047,10 @@
         const oteTxt = inOTE ? ' ✦ Inside OTE golden pocket — high-precision entry.' : '';
         const safety = safeToFire(slot, 'SELL');
         if(safety.ok){
-          fireSignal(symbol, tf, 'SELL', price, `Price retraced into a bearish FVG (${z.bottom.toFixed(2)}–${z.top.toFixed(2)}) inside bearish structure.${oteTxt}${htfTxt}`);
+          const macd = calcMACD(slot.candles);
+          const session = currentSession();
+          fireSignal(symbol, tf, 'SELL', price, `Price retraced into a bearish FVG (${z.bottom.toFixed(2)}–${z.top.toFixed(2)}) inside bearish structure.${oteTxt}${htfTxt}`,
+            { structureOk: true, htfOk: true, inOTE: !!inOTE, macdAgrees: macd ? !macd.bullish : false, freshImpulseFvg: true, sweepConfirmed: false, goodSession: session.active });
           slot.lastFireTime = currentTime;
           z.mitigated = true;
         } else {
@@ -898,21 +1096,28 @@
     return { achievable: false, minLot, minLotRisk, slDistance };
   }
 
-  function fireSignal(symbol, tf, side, price, reason){
+  function fireSignal(symbol, tf, side, price, reason, confluenceMeta){
+    if(dailyLossLimitReached()) return;
     const { sl, tp } = getSLTP(symbol, tf, side, price);
     const balance = parseFloat(acctBalanceEl.value);
     const riskPct = parseFloat(riskPctEl.value) || 1;
     const riskAmount = (balance && balance > 0) ? balance * (riskPct / 100) : null;
     const quality = assessTradeQuality(symbol, tf, side, price, sl, tp);
     const goldPlan = symbol === 'frxXAUUSD' ? goldPositionPlan(price, sl, 2) : null;
-    signalLog.unshift({ time: new Date(), symbol, tf, side, price, sl, tp, reason, riskAmount, riskPct, quality, goldPlan, status: 'open', exitPrice: null, pnl: null });
+    const confluence = scoreConfluence(confluenceMeta || {});
+    const oneToOne = side === 'BUY' ? price + (price - sl) : price - (sl - price);
+    signalLog.unshift({
+      time: new Date(), symbol, tf, side, price, sl, tp, reason, riskAmount, riskPct, quality, goldPlan,
+      confluence, partialTp: oneToOne, beHit: false, partialHit: false, partialPrice: null,
+      status: 'open', exitPrice: null, pnl: null
+    });
     if(signalLog.length > 50) signalLog.pop();
     renderLog();
     updatePerformancePanel();
     saveSignalLog();
     bumpDailyCount();
     const sym = SYMBOLS.find(x => x.code === symbol);
-    notify(`${side} ${sym ? sym.name : symbol} · ${tf}`, reason);
+    notify(`${side} ${sym ? sym.name : symbol} · ${tf} · ${'★'.repeat(confluence)}`, reason);
   }
 
   function renderLog(){
@@ -924,7 +1129,7 @@
     el.innerHTML = signalLog.map(s => {
       const sym = SYMBOLS.find(x => x.code === s.symbol);
       const outcomeHtml = s.status === 'open'
-        ? `<div class="log-outcome open">Status: open, tracking toward SL/TP</div>`
+        ? `<div class="log-outcome open">Status: open, tracking toward SL/TP${s.beHit ? ' · BE hit — move SL to entry' : ''}${s.partialHit ? ' · 1:1 reached — take partial here' : ''}</div>`
         : `<div class="log-outcome ${s.status}">${s.status === 'win' ? 'Hit TP' : 'Hit SL'}${s.pnl != null ? ` · ${s.pnl >= 0 ? '+' : ''}$${s.pnl.toFixed(2)} (0.1 lot, simulated)` : ' · point value not set for this instrument'}</div>`;
       const goldPlanHtml = s.goldPlan
         ? (s.goldPlan.achievable
@@ -943,6 +1148,9 @@
               <div class="gp-right">Stop ${s.goldPlan.slDistance.toFixed(2)} pts away<br/>Minimum size risks ≈ $${s.goldPlan.minLotRisk.toFixed(2)}</div>
             </div>`)
         : '';
+      const confluenceHtml = s.confluence
+        ? `<div class="log-confluence">${'★'.repeat(s.confluence)}${'☆'.repeat(5 - s.confluence)} <span>confluence</span></div>`
+        : '';
       return `
       <div class="log-row ${s.side.toLowerCase()}">
         <div class="log-time">${s.time.toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'})}</div>
@@ -950,8 +1158,9 @@
         <div class="log-tf">${s.tf}</div>
         <div class="log-side ${s.side.toLowerCase()}">${s.side}</div>
         <div class="log-price">${s.price.toFixed(2)}</div>
+        ${confluenceHtml}
         <div class="log-why">Why: ${s.reason}</div>
-        <div class="log-risk">SL ${s.sl.toFixed(2)} · TP ${s.tp.toFixed(2)} · R 1:3${s.riskAmount ? ` <span class="log-risk-amt">· risking ~$${s.riskAmount.toFixed(2)} (${s.riskPct}% of balance) — confirm point value with your broker</span>` : ''}</div>
+        <div class="log-risk">SL ${s.sl.toFixed(2)} · Partial TP (1:1) ${s.partialTp != null ? s.partialTp.toFixed(2) : '—'} · Full TP ${s.tp.toFixed(2)} · R 1:3${s.riskAmount ? ` <span class="log-risk-amt">· risking ~$${s.riskAmount.toFixed(2)} (${s.riskPct}% of balance) — confirm point value with your broker</span>` : ''}</div>
         ${goldPlanHtml}
         <div class="log-quality ${s.quality.warn ? 'warn' : 'ok'}">${s.quality.warn ? '⚠' : '✓'} ${s.quality.text}</div>
         ${outcomeHtml}
@@ -1084,6 +1293,18 @@
   }
 
   window.addEventListener('resize', () => SYMBOLS.forEach(s => renderAll(s.code)));
+
+  function updateSessionBadge(){
+    const el = document.getElementById('sessionBadge');
+    if(!el) return;
+    const s = currentSession();
+    el.textContent = `${s.name} · ${s.note}`;
+    el.className = 'session-badge' + (s.active ? ' active' : '');
+  }
+  updateSessionBadge();
+  setInterval(updateSessionBadge, 60000);
+  renderLog();
+  updatePerformancePanel();
 
   connect();
 </script>
