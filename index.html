@@ -186,6 +186,7 @@
   }
   .gold-plan.unreachable .gp-label{ color: var(--short); }
 </style>
+<script type="text/javascript" src="https://cdn.jsdelivr.net/npm/@emailjs/browser@4/dist/email.min.js"></script>
 </head>
 <body>
 <svg class="bot-bg" viewBox="0 0 400 420" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
@@ -250,7 +251,32 @@
     </div>
     <div id="dailyLossStatus" class="sym-tf" style="margin-bottom:10px;">Today's simulated P/L: $0.00</div>
     <button class="alertBtn" id="alertBtn" onclick="enableAlerts()">🔔 Enable sound + notification alerts</button>
-    <div id="alertStatus" class="sym-tf" style="margin-top:8px;">Alerts off — tap to enable. For alerts to work when the screen is locked, add this page to your Home Screen first.</div>
+    <div id="alertStatus" class="sym-tf" style="margin-top:8px; margin-bottom:14px;">Alerts off — tap to enable. For alerts to work when the screen is locked, add this page to your Home Screen first.</div>
+
+    <div style="border-top:1px solid var(--hairline); padding-top:12px;">
+      <div class="sym-name" style="font-size:13px; margin-bottom:6px;">Email Alerts (via EmailJS)</div>
+      <div class="risk-row">
+        <div class="risk-field">
+          <label for="ejPublicKey">EmailJS Public Key</label>
+          <input type="text" id="ejPublicKey" placeholder="from EmailJS account page" />
+        </div>
+        <div class="risk-field">
+          <label for="ejServiceId">Service ID</label>
+          <input type="text" id="ejServiceId" placeholder="e.g. service_xxxx" />
+        </div>
+      </div>
+      <div class="risk-row">
+        <div class="risk-field">
+          <label for="ejTemplateId">Template ID</label>
+          <input type="text" id="ejTemplateId" placeholder="e.g. template_xxxx" />
+        </div>
+        <div class="risk-field">
+          <label for="ejToEmail">Send to</label>
+          <input type="text" id="ejToEmail" value="chaydenrossstainbank18@gmail.com" />
+        </div>
+      </div>
+      <div id="emailStatus" class="sym-tf" style="margin-top:4px; line-height:1.5;">Not configured yet. Sign up free at emailjs.com, connect Gmail as a service, create one template with a single body field, then paste the three IDs above — your email will arrive in this exact format every time a signal fires.</div>
+    </div>
   </div>
 
   <div class="panel" id="panel-frxXAUUSD">
@@ -306,7 +332,7 @@
     <div class="sym-tf" style="margin-top:6px; line-height:1.5;">Tracks what every fired signal would have done if held to its SL or TP at 0.1 lot. Gold = $10/point, Step Index = $1/point — confirmed from real fills. Signals are saved and persist across sessions. Real results will differ with spread and slippage.</div>
   </div>
 
-  <p class="footnote">A signal only fires when a Strat trigger or FVG retest agrees with the structure bias on that timeframe AND the higher timeframe(s) above it. A minimum gap between signals on the same timeframe prevents rapid clustering. The risk reference uses your entered account size and risk % only to estimate a dollar amount — it does not calculate lot size, since point value differs by instrument and broker; confirm that with your contract specs before sizing a position. For alerts to keep working with the screen locked, add this page to your Home Screen via Safari's share menu. This is a rules-based read of price action, not a guarantee or financial advice.</p>
+  <p class="footnote">A signal only fires when it scores at least 3 of 5 stars on confluence (structure, higher-timeframe agreement, OTE zone, MACD direction, fresh impulse FVG, liquidity sweep confirmation, session quality) AND passes the momentum/MACD safety checks. Stops are placed against the precise structural level for that entry (FVG edge or sweep wick) where available, falling back to the nearest swing point — this is tighter than a generic distance, but still reflects real invalidation, not an arbitrary number. A minimum gap between signals on the same timeframe prevents rapid clustering. The risk reference uses your entered account size and risk % only to estimate a dollar amount — it does not calculate lot size, since point value differs by instrument and broker; confirm that with your contract specs before sizing a position. For alerts to keep working with the screen locked, add this page to your Home Screen via Safari's share menu. This is a rules-based read of price action, not a guarantee or financial advice.</p>
 
 </div>
 
@@ -554,13 +580,15 @@
     const nearestLow = priorLows.length ? priorLows[priorLows.length - 1] : null;
 
     if(nearestHigh && trigger.high > nearestHigh.price && trigger.close < nearestHigh.price && confirm.close < trigger.low){
-      return { dir: 'down', level: nearestHigh.price, type: 'sell-side sweep above prior high' };
+      return { dir: 'down', level: nearestHigh.price, wickExtreme: trigger.high, type: 'sell-side sweep above prior high' };
     }
     if(nearestLow && trigger.low < nearestLow.price && trigger.close > nearestLow.price && confirm.close > trigger.high){
-      return { dir: 'up', level: nearestLow.price, type: 'buy-side sweep below prior low' };
+      return { dir: 'up', level: nearestLow.price, wickExtreme: trigger.low, type: 'buy-side sweep below prior low' };
     }
     return null;
   }
+
+  const MIN_CONFLUENCE = 3; // signals below this star rating are not fired — raises overall accuracy
 
   // --- Confluence scoring: how many independent conditions support this entry ---
   function scoreConfluence({ structureOk, htfOk, inOTE, macdAgrees, freshImpulseFvg, sweepConfirmed, goodSession }){
@@ -637,6 +665,42 @@
     if('Notification' in window && Notification.permission === 'granted'){
       try{ new Notification(title, { body }); }catch(e){}
     }
+  }
+
+  // --- Email alerts via EmailJS (client-side, public-key based — see chat for setup) ---
+  const ejPublicKeyEl = document.getElementById('ejPublicKey');
+  const ejServiceIdEl = document.getElementById('ejServiceId');
+  const ejTemplateIdEl = document.getElementById('ejTemplateId');
+  const ejToEmailEl = document.getElementById('ejToEmail');
+  [['ejPublicKey', ejPublicKeyEl], ['ejServiceId', ejServiceIdEl], ['ejTemplateId', ejTemplateIdEl], ['ejToEmail', ejToEmailEl]].forEach(([key, el]) => {
+    const saved = localStorage.getItem('sw_' + key);
+    if(saved) el.value = saved;
+    el.addEventListener('input', () => { localStorage.setItem('sw_' + key, el.value); updateEmailStatus(); });
+  });
+  function emailConfigured(){
+    return ejPublicKeyEl.value && ejServiceIdEl.value && ejTemplateIdEl.value && ejToEmailEl.value;
+  }
+  function updateEmailStatus(){
+    const el = document.getElementById('emailStatus');
+    if(!el) return;
+    el.textContent = emailConfigured()
+      ? `Configured — emails will be sent to ${ejToEmailEl.value} on every fired signal.`
+      : 'Not configured yet. Sign up free at emailjs.com, connect Gmail as a service, create one template with a single body field, then paste the three IDs above — your email will arrive in this exact format every time a signal fires.';
+  }
+  updateEmailStatus();
+
+  function emailSignal(symbol, side, sl, tp, entry){
+    if(!emailConfigured() || typeof emailjs === 'undefined') return;
+    const sym = SYMBOLS.find(x => x.code === symbol);
+    const name = sym ? sym.name : symbol;
+    const subject = `${side} ${name}`;
+    const message = `${side} ${name}\nEntry: ${entry.toFixed(2)}\nSL: ${sl.toFixed(2)}\nTP: ${tp.toFixed(2)}`;
+    try{
+      emailjs.send(ejServiceIdEl.value, ejTemplateIdEl.value,
+        { subject, message, to_email: ejToEmailEl.value },
+        { publicKey: ejPublicKeyEl.value }
+      ).catch(() => {});
+    }catch(e){}
   }
 
   let ws = null;
@@ -957,10 +1021,10 @@
           const oteTxt = inOTE ? ' ✦ Inside OTE golden pocket — high-precision entry.' : '';
           const macd = calcMACD(c);
           const session = currentSession();
-          fireSignal(symbol, tf, side, currentPrice,
+          const fired = fireSignal(symbol, tf, side, currentPrice,
             `Strat ${sp.pattern} triggered ${dirBias}.${levelTxt}${oteTxt}${htfTxt}`,
             { structureOk: true, htfOk: htfAligned, inOTE: !!inOTE, macdAgrees: macd ? (side === 'BUY' ? macd.bullish : !macd.bullish) : false, freshImpulseFvg: false, sweepConfirmed: false, goodSession: session.active });
-          slot.lastFireTime = currentTime;
+          if(fired) slot.lastFireTime = currentTime;
         }
       }
     }
@@ -987,10 +1051,11 @@
     const oteTxt = inOTE ? ' ✦ Inside OTE golden pocket.' : '';
     const macd = calcMACD(c);
     const session = currentSession();
-    fireSignal(symbol, tf, side, currentPrice,
+    const fired = fireSignal(symbol, tf, side, currentPrice,
       `Liquidity sweep: ${sweep.type} at ${sweep.level.toFixed(2)}, price reversed immediately.${oteTxt}${htfTxt}`,
-      { structureOk: true, htfOk: htfAligned, inOTE: !!inOTE, macdAgrees: macd ? (side === 'BUY' ? macd.bullish : !macd.bullish) : false, freshImpulseFvg: false, sweepConfirmed: true, goodSession: session.active });
-    slot.lastFireTime = currentTime;
+      { structureOk: true, htfOk: htfAligned, inOTE: !!inOTE, macdAgrees: macd ? (side === 'BUY' ? macd.bullish : !macd.bullish) : false, freshImpulseFvg: false, sweepConfirmed: true, goodSession: session.active },
+      sweep.wickExtreme);
+    if(fired) slot.lastFireTime = currentTime;
   }
 
   function isHigherTfAligned(symbol, tf, dirBias){
@@ -1034,10 +1099,10 @@
         if(safety.ok){
           const macd = calcMACD(slot.candles);
           const session = currentSession();
-          fireSignal(symbol, tf, 'BUY', price, `Price retraced into a bullish FVG (${z.bottom.toFixed(2)}–${z.top.toFixed(2)}) inside bullish structure.${oteTxt}${htfTxt}`,
-            { structureOk: true, htfOk: true, inOTE: !!inOTE, macdAgrees: macd ? macd.bullish : false, freshImpulseFvg: true, sweepConfirmed: false, goodSession: session.active });
-          slot.lastFireTime = currentTime;
-          z.mitigated = true;
+          const fired = fireSignal(symbol, tf, 'BUY', price, `Price retraced into a bullish FVG (${z.bottom.toFixed(2)}–${z.top.toFixed(2)}) inside bullish structure.${oteTxt}${htfTxt}`,
+            { structureOk: true, htfOk: true, inOTE: !!inOTE, macdAgrees: macd ? macd.bullish : false, freshImpulseFvg: true, sweepConfirmed: false, goodSession: session.active },
+            z.bottom);
+          if(fired){ slot.lastFireTime = currentTime; z.mitigated = true; } else { z.mitigated = false; }
         } else {
           z.mitigated = false;
         }
@@ -1049,10 +1114,10 @@
         if(safety.ok){
           const macd = calcMACD(slot.candles);
           const session = currentSession();
-          fireSignal(symbol, tf, 'SELL', price, `Price retraced into a bearish FVG (${z.bottom.toFixed(2)}–${z.top.toFixed(2)}) inside bearish structure.${oteTxt}${htfTxt}`,
-            { structureOk: true, htfOk: true, inOTE: !!inOTE, macdAgrees: macd ? !macd.bullish : false, freshImpulseFvg: true, sweepConfirmed: false, goodSession: session.active });
-          slot.lastFireTime = currentTime;
-          z.mitigated = true;
+          const fired = fireSignal(symbol, tf, 'SELL', price, `Price retraced into a bearish FVG (${z.bottom.toFixed(2)}–${z.top.toFixed(2)}) inside bearish structure.${oteTxt}${htfTxt}`,
+            { structureOk: true, htfOk: true, inOTE: !!inOTE, macdAgrees: macd ? !macd.bullish : false, freshImpulseFvg: true, sweepConfirmed: false, goodSession: session.active },
+            z.top);
+          if(fired){ slot.lastFireTime = currentTime; z.mitigated = true; } else { z.mitigated = false; }
         } else {
           z.mitigated = false;
         }
@@ -1064,17 +1129,24 @@
     });
   }
 
-  function getSLTP(symbol, tf, side, entry){
+  function getSLTP(symbol, tf, side, entry, tightRef){
     const slot = state[symbol][tf];
-    const buffer = entry * 0.0006;
-    const fallback = slot.candles.slice(-12, -1);
     let sl;
-    if(side === 'BUY'){
-      const swingLow = slot.lastSwingLow ? slot.lastSwingLow.price : Math.min(...fallback.map(x => x.low));
-      sl = swingLow - buffer;
+    if(tightRef != null){
+      // Precise structural reference (FVG edge or sweep wick) — tighter buffer since the level itself is exact
+      const buffer = entry * 0.00018;
+      sl = side === 'BUY' ? tightRef - buffer : tightRef + buffer;
     } else {
-      const swingHigh = slot.lastSwingHigh ? slot.lastSwingHigh.price : Math.max(...fallback.map(x => x.high));
-      sl = swingHigh + buffer;
+      // Fallback: nearest swing point, reduced buffer from before for a tighter stop overall
+      const buffer = entry * 0.0004;
+      const fallback = slot.candles.slice(-12, -1);
+      if(side === 'BUY'){
+        const swingLow = slot.lastSwingLow ? slot.lastSwingLow.price : Math.min(...fallback.map(x => x.low));
+        sl = swingLow - buffer;
+      } else {
+        const swingHigh = slot.lastSwingHigh ? slot.lastSwingHigh.price : Math.max(...fallback.map(x => x.high));
+        sl = swingHigh + buffer;
+      }
     }
     const risk = Math.abs(entry - sl);
     const tp = side === 'BUY' ? entry + risk * 3 : entry - risk * 3;
@@ -1096,15 +1168,16 @@
     return { achievable: false, minLot, minLotRisk, slDistance };
   }
 
-  function fireSignal(symbol, tf, side, price, reason, confluenceMeta){
-    if(dailyLossLimitReached()) return;
-    const { sl, tp } = getSLTP(symbol, tf, side, price);
+  function fireSignal(symbol, tf, side, price, reason, confluenceMeta, tightRef){
+    if(dailyLossLimitReached()) return false;
+    const confluence = scoreConfluence(confluenceMeta || {});
+    if(confluence < MIN_CONFLUENCE) return false;
+    const { sl, tp } = getSLTP(symbol, tf, side, price, tightRef);
     const balance = parseFloat(acctBalanceEl.value);
     const riskPct = parseFloat(riskPctEl.value) || 1;
     const riskAmount = (balance && balance > 0) ? balance * (riskPct / 100) : null;
     const quality = assessTradeQuality(symbol, tf, side, price, sl, tp);
     const goldPlan = symbol === 'frxXAUUSD' ? goldPositionPlan(price, sl, 2) : null;
-    const confluence = scoreConfluence(confluenceMeta || {});
     const oneToOne = side === 'BUY' ? price + (price - sl) : price - (sl - price);
     signalLog.unshift({
       time: new Date(), symbol, tf, side, price, sl, tp, reason, riskAmount, riskPct, quality, goldPlan,
@@ -1118,6 +1191,8 @@
     bumpDailyCount();
     const sym = SYMBOLS.find(x => x.code === symbol);
     notify(`${side} ${sym ? sym.name : symbol} · ${tf} · ${'★'.repeat(confluence)}`, reason);
+    emailSignal(symbol, side, sl, tp, price);
+    return true;
   }
 
   function renderLog(){
