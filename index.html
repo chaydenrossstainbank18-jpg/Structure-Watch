@@ -332,7 +332,7 @@
     <div class="sym-tf" style="margin-top:6px; line-height:1.5;">Tracks what every fired signal would have done if held to its SL or TP at 0.1 lot. Gold = $10/point, Step Index = $1/point — confirmed from real fills. Signals are saved and persist across sessions. Real results will differ with spread and slippage.</div>
   </div>
 
-  <p class="footnote">A signal only fires when it scores at least 3 of 5 stars on confluence (structure, higher-timeframe agreement, OTE zone, MACD direction, fresh impulse FVG, liquidity sweep confirmation, session quality) AND passes the momentum/MACD safety checks. Stops are placed against the precise structural level for that entry (FVG edge or sweep wick) where available, falling back to the nearest swing point — this is tighter than a generic distance, but still reflects real invalidation, not an arbitrary number. A minimum gap between signals on the same timeframe prevents rapid clustering. The risk reference uses your entered account size and risk % only to estimate a dollar amount — it does not calculate lot size, since point value differs by instrument and broker; confirm that with your contract specs before sizing a position. For alerts to keep working with the screen locked, add this page to your Home Screen via Safari's share menu. This is a rules-based read of price action, not a guarantee or financial advice.</p>
+  <p class="footnote">FVG and Strat-trigger entries require price to have pulled back 40–60% of the most recent swing before firing (shown as the blue zone on each chart) — this stops the tool from chasing a move that's already extended. Every trigger candle is read individually (strong body, rejection wick, engulfing, or doji) and a doji/indecisive candle blocks the signal outright. Once a symbol fires in one direction, the opposite direction is locked out for 10 minutes across all timeframes, so you won't see a buy and a sell minutes apart contradicting each other. A signal also needs at least 3 of 5 confluence stars (structure, higher-timeframe agreement, OTE zone, MACD direction, fresh impulse FVG, sweep confirmation, session quality) and must pass the momentum/MACD safety checks. Stops are placed against the precise structural level for that entry (FVG edge or sweep wick) where available, falling back to the nearest swing point. The risk reference uses your entered account size and risk % only to estimate a dollar amount — it does not calculate lot size, since point value differs by instrument and broker; confirm that with your contract specs before sizing a position. For alerts to keep working with the screen locked, add this page to your Home Screen via Safari's share menu. This is a rules-based read of price action, not a guarantee or financial advice.</p>
 
 </div>
 
@@ -589,6 +589,7 @@
   }
 
   const MIN_CONFLUENCE = 3; // signals below this star rating are not fired — raises overall accuracy
+  const OPPOSITE_LOCK_MS = 10 * 60 * 1000; // once a direction fires for a symbol, opposite-direction signals are blocked for this long, across all timeframes
 
   // --- Confluence scoring: how many independent conditions support this entry ---
   function scoreConfluence({ structureOk, htfOk, inOTE, macdAgrees, freshImpulseFvg, sweepConfirmed, goodSession }){
@@ -912,20 +913,60 @@
     }
     slot.recentSwings = swings;
 
-    // --- OTE: Optimal Trade Entry (Fibonacci 62%–79% golden pocket) ---
+    // --- OTE: Optimal Trade Entry (Fibonacci 62%–79% golden pocket, deeper/bonus precision) ---
     if(lastSwingHigh && lastSwingLow){
       const swingH = lastSwingHigh.price;
       const swingL = lastSwingLow.price;
       if(slot.bias === 'bullish'){
         slot.ote = { top: swingL + (swingH - swingL) * 0.38, bottom: swingL + (swingH - swingL) * 0.21, type: 'bullish' };
+        slot.pullback = { top: swingL + (swingH - swingL) * 0.60, bottom: swingL + (swingH - swingL) * 0.40, type: 'bullish' };
       } else if(slot.bias === 'bearish'){
         slot.ote = { top: swingH - (swingH - swingL) * 0.21, bottom: swingH - (swingH - swingL) * 0.38, type: 'bearish' };
+        slot.pullback = { top: swingH - (swingH - swingL) * 0.40, bottom: swingH - (swingH - swingL) * 0.60, type: 'bearish' };
       } else {
         slot.ote = null;
+        slot.pullback = null;
       }
     } else {
       slot.ote = null;
+      slot.pullback = null;
     }
+  }
+
+  // --- Candle interpretation: what does this specific candle actually mean? ---
+  function classifyCandle(c, prev){
+    const range = c.high - c.low;
+    const body = Math.abs(c.close - c.open);
+    if(range === 0) return { type: 'flat', label: 'flat candle, no range — ignore' };
+    const bodyRatio = body / range;
+    const upperWick = c.high - Math.max(c.open, c.close);
+    const lowerWick = Math.min(c.open, c.close) - c.low;
+    const bullish = c.close > c.open;
+
+    if(bodyRatio < 0.15){
+      return { type: 'doji', decisive: false, label: 'doji / indecision candle — buyers and sellers in balance, no conviction' };
+    }
+    if(lowerWick > body * 2 && bodyRatio < 0.45){
+      return { type: 'lowerRejection', decisive: true, dir: 'up', label: 'long lower wick rejection — price was pushed down and strongly bought back up' };
+    }
+    if(upperWick > body * 2 && bodyRatio < 0.45){
+      return { type: 'upperRejection', decisive: true, dir: 'down', label: 'long upper wick rejection — price was pushed up and strongly sold back down' };
+    }
+    if(prev && bullish && c.close > prev.high && c.open < prev.close){
+      return { type: 'bullishEngulfing', decisive: true, dir: 'up', label: 'bullish engulfing — fully consumed the prior candle, strong buyer conviction' };
+    }
+    if(prev && !bullish && c.close < prev.low && c.open > prev.close){
+      return { type: 'bearishEngulfing', decisive: true, dir: 'down', label: 'bearish engulfing — fully consumed the prior candle, strong seller conviction' };
+    }
+    if(bodyRatio >= 0.6){
+      return { type: bullish ? 'strongBull' : 'strongBear', decisive: true, dir: bullish ? 'up' : 'down', label: `strong ${bullish ? 'bullish' : 'bearish'} body (${(bodyRatio*100).toFixed(0)}% of range) — clear conviction` };
+    }
+    return { type: 'mixed', decisive: false, label: 'mixed/indecisive candle — body and wicks don\'t show clear conviction' };
+  }
+
+  function inZone(zone, dirBias, price){
+    if(!zone || zone.type !== dirBias) return false;
+    return price <= zone.top && price >= zone.bottom;
   }
 
   // --- MACD (12,26,9) from candle closes — same settings as your MT5 chart ---
@@ -990,7 +1031,18 @@
       if(side === 'BUY' && !macd.bullish) return { ok: false, reason: 'Blocked: MACD is below signal line (bearish) — no buys while momentum is down.' };
     }
 
-    return { ok: true, reason: '' };
+    // 4. Candle interpretation — the trigger candle itself must show real conviction, not indecision
+    const triggerCandle = c[c.length - 1];
+    const prevCandle = c[c.length - 2];
+    const interp = classifyCandle(triggerCandle, prevCandle);
+    if(!interp.decisive){
+      return { ok: false, reason: `Blocked: trigger candle is ${interp.label} — not enough conviction to act on.` };
+    }
+    if(interp.dir && ((side === 'BUY' && interp.dir === 'down') || (side === 'SELL' && interp.dir === 'up'))){
+      return { ok: false, reason: `Blocked: trigger candle reads as ${interp.label}, which contradicts a ${side.toLowerCase()}.` };
+    }
+
+    return { ok: true, reason: '', candleNote: interp.label };
   }
 
   function evaluateStratTrigger(symbol, tf){
@@ -1008,9 +1060,9 @@
       const htfAligned = isHigherTfAligned(symbol, tf, dirBias);
       const currentTime = triggerCandle.open_time;
       const currentPrice = triggerCandle.close;
-      const inOTE = slot.ote && slot.ote.type === dirBias &&
-        currentPrice <= slot.ote.top && currentPrice >= slot.ote.bottom;
-      if(slot.bias === dirBias && strongBody && htfAligned && canFire(slot, currentTime, tf)){
+      const inOTE = inZone(slot.ote, dirBias, currentPrice);
+      const inPullback = inZone(slot.pullback, dirBias, currentPrice);
+      if(slot.bias === dirBias && strongBody && htfAligned && inPullback && canFire(slot, currentTime, tf)){
         const side = sp.dir === 'up' ? 'BUY' : 'SELL';
         const safety = safeToFire(slot, side);
         if(safety.ok){
@@ -1019,10 +1071,12 @@
           const htfTxt = tf === '1m' ? ' 5m and 1h not opposing.'
             : tf === '5m' ? ' 1h not opposing.' : '';
           const oteTxt = inOTE ? ' ✦ Inside OTE golden pocket — high-precision entry.' : '';
+          const pullbackTxt = ` Pullback measured at ${slot.pullback.bottom.toFixed(2)}–${slot.pullback.top.toFixed(2)} (40–60% retrace) — entry is not chasing an extended move.`;
+          const candleTxt = safety.candleNote ? ` Trigger candle: ${safety.candleNote}.` : '';
           const macd = calcMACD(c);
           const session = currentSession();
           const fired = fireSignal(symbol, tf, side, currentPrice,
-            `Strat ${sp.pattern} triggered ${dirBias}.${levelTxt}${oteTxt}${htfTxt}`,
+            `Strat ${sp.pattern} triggered ${dirBias}.${levelTxt}${pullbackTxt}${candleTxt}${oteTxt}${htfTxt}`,
             { structureOk: true, htfOk: htfAligned, inOTE: !!inOTE, macdAgrees: macd ? (side === 'BUY' ? macd.bullish : !macd.bullish) : false, freshImpulseFvg: false, sweepConfirmed: false, goodSession: session.active });
           if(fired) slot.lastFireTime = currentTime;
         }
@@ -1045,14 +1099,14 @@
     if(!htfAligned || !canFire(slot, currentTime, tf)) return;
     const safety = safeToFire(slot, side);
     if(!safety.ok) return;
-    const inOTE = slot.ote && slot.ote.type === dirBias &&
-      currentPrice <= slot.ote.top && currentPrice >= slot.ote.bottom;
+    const inOTE = inZone(slot.ote, dirBias, currentPrice);
     const htfTxt = tf === '1m' ? ' 5m and 1h not opposing.' : tf === '5m' ? ' 1h not opposing.' : '';
     const oteTxt = inOTE ? ' ✦ Inside OTE golden pocket.' : '';
+    const candleTxt = safety.candleNote ? ` Reversal candle: ${safety.candleNote}.` : '';
     const macd = calcMACD(c);
     const session = currentSession();
     const fired = fireSignal(symbol, tf, side, currentPrice,
-      `Liquidity sweep: ${sweep.type} at ${sweep.level.toFixed(2)}, price reversed immediately.${oteTxt}${htfTxt}`,
+      `Liquidity sweep: ${sweep.type} at ${sweep.level.toFixed(2)}, price reversed immediately.${candleTxt}${oteTxt}${htfTxt}`,
       { structureOk: true, htfOk: htfAligned, inOTE: !!inOTE, macdAgrees: macd ? (side === 'BUY' ? macd.bullish : !macd.bullish) : false, freshImpulseFvg: false, sweepConfirmed: true, goodSession: session.active },
       sweep.wickExtreme);
     if(fired) slot.lastFireTime = currentTime;
@@ -1089,32 +1143,36 @@
     const currentTime = currentCandle ? currentCandle.open_time : Date.now() / 1000;
     slot.fvgs.forEach(z => {
       if(z.mitigated) return;
-      const inZone = price <= z.top && price >= z.bottom;
-      if(!inZone) return;
-      if(z.type === 'bullish' && slot.bias === 'bullish' && isHigherTfAligned(symbol, tf, 'bullish') && canFire(slot, currentTime, tf)){
-        const inOTE = slot.ote && slot.ote.type === 'bullish' && price <= slot.ote.top && price >= slot.ote.bottom;
+      const inFvgZone = price <= z.top && price >= z.bottom;
+      if(!inFvgZone) return;
+      if(z.type === 'bullish' && slot.bias === 'bullish' && isHigherTfAligned(symbol, tf, 'bullish') && inZone(slot.pullback, 'bullish', price) && canFire(slot, currentTime, tf)){
+        const inOTE = inZone(slot.ote, 'bullish', price);
         const htfTxt = tf === '1m' ? ' 5m and 1h not opposing.' : tf === '5m' ? ' 1h not opposing.' : '';
         const oteTxt = inOTE ? ' ✦ Inside OTE golden pocket — high-precision entry.' : '';
+        const pullbackTxt = ` Pullback measured at ${slot.pullback.bottom.toFixed(2)}–${slot.pullback.top.toFixed(2)} (40–60% retrace) — not chasing an extended move.`;
         const safety = safeToFire(slot, 'BUY');
         if(safety.ok){
+          const candleTxt = safety.candleNote ? ` Trigger candle: ${safety.candleNote}.` : '';
           const macd = calcMACD(slot.candles);
           const session = currentSession();
-          const fired = fireSignal(symbol, tf, 'BUY', price, `Price retraced into a bullish FVG (${z.bottom.toFixed(2)}–${z.top.toFixed(2)}) inside bullish structure.${oteTxt}${htfTxt}`,
+          const fired = fireSignal(symbol, tf, 'BUY', price, `Price retraced into a bullish FVG (${z.bottom.toFixed(2)}–${z.top.toFixed(2)}) inside bullish structure.${pullbackTxt}${candleTxt}${oteTxt}${htfTxt}`,
             { structureOk: true, htfOk: true, inOTE: !!inOTE, macdAgrees: macd ? macd.bullish : false, freshImpulseFvg: true, sweepConfirmed: false, goodSession: session.active },
             z.bottom);
           if(fired){ slot.lastFireTime = currentTime; z.mitigated = true; } else { z.mitigated = false; }
         } else {
           z.mitigated = false;
         }
-      } else if(z.type === 'bearish' && slot.bias === 'bearish' && isHigherTfAligned(symbol, tf, 'bearish') && canFire(slot, currentTime, tf)){
-        const inOTE = slot.ote && slot.ote.type === 'bearish' && price <= slot.ote.top && price >= slot.ote.bottom;
+      } else if(z.type === 'bearish' && slot.bias === 'bearish' && isHigherTfAligned(symbol, tf, 'bearish') && inZone(slot.pullback, 'bearish', price) && canFire(slot, currentTime, tf)){
+        const inOTE = inZone(slot.ote, 'bearish', price);
         const htfTxt = tf === '1m' ? ' 5m and 1h not opposing.' : tf === '5m' ? ' 1h not opposing.' : '';
         const oteTxt = inOTE ? ' ✦ Inside OTE golden pocket — high-precision entry.' : '';
+        const pullbackTxt = ` Pullback measured at ${slot.pullback.bottom.toFixed(2)}–${slot.pullback.top.toFixed(2)} (40–60% retrace) — not chasing an extended move.`;
         const safety = safeToFire(slot, 'SELL');
         if(safety.ok){
+          const candleTxt = safety.candleNote ? ` Trigger candle: ${safety.candleNote}.` : '';
           const macd = calcMACD(slot.candles);
           const session = currentSession();
-          const fired = fireSignal(symbol, tf, 'SELL', price, `Price retraced into a bearish FVG (${z.bottom.toFixed(2)}–${z.top.toFixed(2)}) inside bearish structure.${oteTxt}${htfTxt}`,
+          const fired = fireSignal(symbol, tf, 'SELL', price, `Price retraced into a bearish FVG (${z.bottom.toFixed(2)}–${z.top.toFixed(2)}) inside bearish structure.${pullbackTxt}${candleTxt}${oteTxt}${htfTxt}`,
             { structureOk: true, htfOk: true, inOTE: !!inOTE, macdAgrees: macd ? !macd.bullish : false, freshImpulseFvg: true, sweepConfirmed: false, goodSession: session.active },
             z.top);
           if(fired){ slot.lastFireTime = currentTime; z.mitigated = true; } else { z.mitigated = false; }
@@ -1172,6 +1230,10 @@
     if(dailyLossLimitReached()) return false;
     const confluence = scoreConfluence(confluenceMeta || {});
     if(confluence < MIN_CONFLUENCE) return false;
+    const symState = state[symbol];
+    if(symState.lastSignalDir && symState.lastSignalDir !== side && (Date.now() - symState.lastSignalTime) < OPPOSITE_LOCK_MS){
+      return false; // blocks contradictory signals firing seconds/minutes apart across different timeframes
+    }
     const { sl, tp } = getSLTP(symbol, tf, side, price, tightRef);
     const balance = parseFloat(acctBalanceEl.value);
     const riskPct = parseFloat(riskPctEl.value) || 1;
@@ -1185,6 +1247,8 @@
       status: 'open', exitPrice: null, pnl: null
     });
     if(signalLog.length > 50) signalLog.pop();
+    symState.lastSignalDir = side;
+    symState.lastSignalTime = Date.now();
     renderLog();
     updatePerformancePanel();
     saveSignalLog();
@@ -1267,12 +1331,12 @@
     if(activeSlot.lastStrat){
       const arrow = activeSlot.lastStrat.dir === 'up' ? '▲' : '▼';
       let txt = `${TIMEFRAMES.find(t=>t.key===sym.activeTf).label} trigger: ${activeSlot.lastStrat.pattern} ${arrow}`;
-      if(activeSlot.ote){
-        txt += `  ·  OTE ${activeSlot.ote.bottom.toFixed(2)}–${activeSlot.ote.top.toFixed(2)}`;
+      if(activeSlot.pullback){
+        txt += `  ·  Pullback ${activeSlot.pullback.bottom.toFixed(2)}–${activeSlot.pullback.top.toFixed(2)}`;
       }
       triggerEl.textContent = txt;
-    } else if(activeSlot.ote){
-      triggerEl.textContent = `OTE golden pocket: ${activeSlot.ote.bottom.toFixed(2)}–${activeSlot.ote.top.toFixed(2)}`;
+    } else if(activeSlot.pullback){
+      triggerEl.textContent = `Pullback zone (entry gate): ${activeSlot.pullback.bottom.toFixed(2)}–${activeSlot.pullback.top.toFixed(2)}`;
     } else {
       triggerEl.textContent = '';
     }
@@ -1311,6 +1375,17 @@
     const xAt = i => leftPad + i * stepX + stepX / 2;
     const yAt = p => topPad + (maxP - p) / (maxP - minP) * chartH;
 
+    if(slot.pullback){
+      const y0 = yAt(slot.pullback.top), y1 = yAt(slot.pullback.bottom);
+      ctx.fillStyle = 'rgba(99,160,255,0.08)';
+      ctx.fillRect(leftPad, Math.min(y0,y1), chartW, Math.abs(y1-y0));
+      ctx.strokeStyle = 'rgba(99,160,255,0.3)';
+      ctx.lineWidth = 0.8;
+      ctx.setLineDash([3,3]);
+      ctx.beginPath(); ctx.moveTo(leftPad, Math.min(y0,y1)); ctx.lineTo(leftPad+chartW, Math.min(y0,y1)); ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(leftPad, Math.max(y0,y1)); ctx.lineTo(leftPad+chartW, Math.max(y0,y1)); ctx.stroke();
+      ctx.setLineDash([]);
+    }
     if(slot.ote){
       const y0 = yAt(slot.ote.top), y1 = yAt(slot.ote.bottom);
       ctx.fillStyle = 'rgba(239,170,63,0.07)';
