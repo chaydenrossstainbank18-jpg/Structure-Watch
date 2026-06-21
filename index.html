@@ -185,6 +185,20 @@
     border-color: rgba(240,86,111,0.3);
   }
   .gold-plan.unreachable .gp-label{ color: var(--short); }
+
+  .assistant-output{
+    font-size: 13px; line-height: 1.6; color: var(--ink);
+    background: rgba(255,255,255,0.02); border: 1px solid var(--hairline); border-radius: 9px;
+    padding: 13px 14px; margin-bottom: 12px; white-space: pre-line; min-height: 40px;
+  }
+  .assistant-buttons{ display:flex; flex-wrap:wrap; gap: 8px; }
+  .qBtn{
+    flex: 1 1 calc(50% - 8px); min-width: 130px;
+    background: rgba(63,224,160,0.08); color: var(--long); border: 1px solid rgba(63,224,160,0.25);
+    border-radius: 8px; padding: 9px 10px; font-family:'JetBrains Mono', monospace; font-size: 11px;
+    font-weight: 600; cursor: pointer;
+  }
+  .qBtn:active{ background: rgba(63,224,160,0.18); }
 </style>
 <script type="text/javascript" src="https://cdn.jsdelivr.net/npm/@emailjs/browser@4/dist/email.min.js"></script>
 </head>
@@ -332,7 +346,23 @@
     <div class="sym-tf" style="margin-top:6px; line-height:1.5;">Tracks what every fired signal would have done if held to its SL or TP at 0.1 lot. Gold = $10/point, Step Index = $1/point — confirmed from real fills. Signals are saved and persist across sessions. Real results will differ with spread and slippage.</div>
   </div>
 
-  <p class="footnote">FVG and Strat-trigger entries require price to have pulled back 40–60% of the most recent swing before firing (shown as the blue zone on each chart) — this stops the tool from chasing a move that's already extended. Every trigger candle is read individually (strong body, rejection wick, engulfing, or doji) and a doji/indecisive candle blocks the signal outright. Once a symbol fires in one direction, the opposite direction is locked out for 10 minutes across all timeframes, so you won't see a buy and a sell minutes apart contradicting each other. A signal also needs at least 3 of 5 confluence stars (structure, higher-timeframe agreement, OTE zone, MACD direction, fresh impulse FVG, sweep confirmation, session quality) and must pass the momentum/MACD safety checks. Stops are placed against the precise structural level for that entry (FVG edge or sweep wick) where available, falling back to the nearest swing point. The risk reference uses your entered account size and risk % only to estimate a dollar amount — it does not calculate lot size, since point value differs by instrument and broker; confirm that with your contract specs before sizing a position. For alerts to keep working with the screen locked, add this page to your Home Screen via Safari's share menu. This is a rules-based read of price action, not a guarantee or financial advice.</p>
+  <div class="panel">
+    <div class="panel-head">
+      <div>
+        <div class="sym-name">Assistant</div>
+        <div class="sym-tf">READS YOUR OWN SAVED SIGNAL HISTORY · NO EXTERNAL AI</div>
+      </div>
+    </div>
+    <div id="assistantOutput" class="assistant-output">Building your overview…</div>
+    <div class="assistant-buttons">
+      <button class="qBtn" onclick="assistantShow('overview')">How am I doing?</button>
+      <button class="qBtn" onclick="assistantShow('mistakes')">What are my mistakes?</button>
+      <button class="qBtn" onclick="assistantShow('state')">Why no signal right now?</button>
+      <button class="qBtn" onclick="assistantShow('patterns')">Any patterns?</button>
+    </div>
+  </div>
+
+  <p class="footnote">FVG and Strat-trigger entries require price to have pulled back 40–60% of the most recent swing before firing (shown as the blue zone on each chart) — this stops the tool from chasing a move that's already extended. Every trigger candle is read individually (strong body, rejection wick, engulfing, or doji) and a doji/indecisive candle blocks the signal outright. Once a symbol fires in one direction, the opposite direction is locked out for 10 minutes across all timeframes, so you won't see a buy and a sell minutes apart contradicting each other. A signal also needs at least 3 of 5 confluence stars (structure, higher-timeframe agreement, OTE zone, MACD direction, fresh impulse FVG, sweep confirmation, session quality) and must pass the momentum/MACD safety checks. Stops are placed against the precise structural level for that entry (FVG edge or sweep wick) where available, falling back to the nearest swing point. The risk reference uses your entered account size and risk % only to estimate a dollar amount — it does not calculate lot size, since point value differs by instrument and broker; confirm that with your contract specs before sizing a position. For alerts to keep working with the screen locked, add this page to your Home Screen via Safari's share menu. The Assistant panel analyzes only this tool's own saved signal history — it is not a general AI and can't answer questions outside that data. This is a rules-based read of price action, not a guarantee or financial advice.</p>
 
 </div>
 
@@ -476,6 +506,7 @@
     document.getElementById('perfOpen').textContent = signalLog.filter(s => s.status === 'open').length + ' open';
     updateDailyPnl();
     drawEquityCurve();
+    if(typeof renderAssistantDefault === 'function') renderAssistantDefault();
   }
 
   function drawEquityCurve(){
@@ -518,6 +549,145 @@
     ctx.stroke();
   }
 
+  // --- Assistant: analyzes this tool's own saved signal history. No external AI, no API calls. ---
+  function groupStats(list, keyFn){
+    const groups = {};
+    list.forEach(s => {
+      const key = keyFn(s);
+      if(key == null) return;
+      if(!groups[key]) groups[key] = { wins: 0, losses: 0, pnl: 0 };
+      if(s.status === 'win') groups[key].wins++;
+      if(s.status === 'loss') groups[key].losses++;
+      if(s.pnl != null) groups[key].pnl += s.pnl;
+    });
+    return Object.entries(groups).map(([key, g]) => ({
+      key, ...g, total: g.wins + g.losses,
+      winRate: (g.wins + g.losses) ? g.wins / (g.wins + g.losses) : null
+    }));
+  }
+
+  function assistantOverview(){
+    const resolved = signalLog.filter(s => s.status === 'win' || s.status === 'loss');
+    const open = signalLog.filter(s => s.status === 'open');
+    if(resolved.length === 0){
+      return open.length
+        ? `No resolved trades yet — ${open.length} signal${open.length === 1 ? ' is' : 's are'} still open and tracking toward SL/TP.`
+        : `No signals fired yet. Once trades start resolving, I'll track real win rate and P/L here.`;
+    }
+    const wins = resolved.filter(s => s.status === 'win').length;
+    const winRate = (wins / resolved.length * 100).toFixed(0);
+    const pnl = resolved.filter(s => s.pnl != null).reduce((sum, s) => sum + s.pnl, 0);
+    const byTf = groupStats(resolved, s => s.tf).sort((a,b) => b.total - a.total)[0];
+    let txt = `${resolved.length} resolved trade${resolved.length === 1 ? '' : 's'} so far: ${wins} win${wins === 1 ? '' : 's'}, ${resolved.length - wins} loss${resolved.length - wins === 1 ? '' : 'es'} — ${winRate}% win rate, ${pnl >= 0 ? '+' : ''}$${pnl.toFixed(2)} simulated at 0.1 lot.`;
+    if(open.length) txt += ` ${open.length} more still open right now.`;
+    if(byTf) txt += ` Most of your volume is on ${byTf.key} (${byTf.total} trades).`;
+    return txt;
+  }
+
+  function assistantMistakes(){
+    const resolved = signalLog.filter(s => s.status === 'win' || s.status === 'loss');
+    if(resolved.length < 5){
+      return `Not enough resolved trades yet (${resolved.length}) to find real patterns — need at least 5 before any slice is statistically meaningful. Ask again once more have closed out.`;
+    }
+    const MIN_SAMPLE = 3;
+    const dims = [
+      { label: 'timeframe', stats: groupStats(resolved, s => s.tf) },
+      { label: 'symbol', stats: groupStats(resolved, s => SYMBOLS.find(x => x.code === s.symbol)?.name || s.symbol) },
+      { label: 'side', stats: groupStats(resolved, s => s.side) },
+      { label: 'trigger type', stats: groupStats(resolved, s => s.triggerType || 'unknown') },
+      { label: 'session', stats: groupStats(resolved, s => s.session || 'unknown') },
+      { label: 'confluence rating', stats: groupStats(resolved, s => s.confluence ? `${s.confluence}★` : null) }
+    ];
+    const findings = [];
+    dims.forEach(d => {
+      const candidates = d.stats.filter(g => g.total >= MIN_SAMPLE && g.winRate != null).sort((a,b) => a.winRate - b.winRate);
+      if(candidates.length && candidates[0].winRate < 0.45){
+        const worst = candidates[0];
+        findings.push(`Your weakest ${d.label} is ${worst.key}: ${worst.wins}/${worst.total} wins (${(worst.winRate*100).toFixed(0)}%), ${worst.pnl >= 0 ? '+' : ''}$${worst.pnl.toFixed(2)}.`);
+      }
+    });
+    const lossStreak = (() => {
+      let streak = 0, max = 0;
+      [...resolved].reverse().forEach(s => { if(s.status === 'loss'){ streak++; max = Math.max(max, streak); } else streak = 0; });
+      return max;
+    })();
+    if(lossStreak >= 3) findings.push(`You've had a streak of ${lossStreak} consecutive losses in your history — worth checking if one condition (session, timeframe) was common across them.`);
+    if(findings.length === 0){
+      return `No clear weak spot yet — losses look fairly evenly spread across timeframe, symbol, session, and trigger type. That's a reasonably healthy sign, though the sample is still small.`;
+    }
+    return findings.join('\n\n');
+  }
+
+  function assistantCurrentState(){
+    const lines = [];
+    SYMBOLS.forEach(sym => {
+      const s = state[sym.code];
+      TIMEFRAMES.forEach(tfDef => {
+        const slot = s[tfDef.key];
+        if(!slot.initialized || !slot.candles.length) return;
+        const price = s.lastPrice;
+        if(slot.bias === 'neutral'){
+          lines.push(`${sym.name} ${tfDef.label}: structure is neutral — no clear bias yet, so nothing can fire here.`);
+          return;
+        }
+        if(!slot.pullback){
+          lines.push(`${sym.name} ${tfDef.label}: ${slot.bias}, but no swing range established yet to measure a pullback zone.`);
+          return;
+        }
+        const inPb = price <= slot.pullback.top && price >= slot.pullback.bottom;
+        if(inPb){
+          lines.push(`${sym.name} ${tfDef.label}: ${slot.bias}, price IS inside the pullback zone (${slot.pullback.bottom.toFixed(2)}–${slot.pullback.top.toFixed(2)}) right now — watching for a trigger candle or FVG retest.`);
+        } else {
+          const mid = (slot.pullback.top + slot.pullback.bottom) / 2;
+          const dist = Math.abs(price - mid);
+          lines.push(`${sym.name} ${tfDef.label}: ${slot.bias}, but price (${price ? price.toFixed(2) : '—'}) hasn't pulled back into the zone (${slot.pullback.bottom.toFixed(2)}–${slot.pullback.top.toFixed(2)}) yet — roughly ${dist.toFixed(2)} away. No chase, waiting.`);
+        }
+      });
+    });
+    const session = currentSession();
+    lines.push(`\nCurrent session: ${session.name} (${session.note}).`);
+    const limit = parseFloat(dailyLossLimitEl.value);
+    if(limit && dailyLossLimitReached()) lines.push(`Daily loss limit reached — signals are paused until tomorrow.`);
+    return lines.length ? lines.join('\n') : 'Still loading market data — check back in a few seconds.';
+  }
+
+  function assistantPatterns(){
+    const resolved = signalLog.filter(s => s.status === 'win' || s.status === 'loss');
+    if(resolved.length < 6){
+      return `Need a few more resolved trades before patterns are meaningful (currently ${resolved.length}).`;
+    }
+    const byConfluence = groupStats(resolved, s => s.confluence).sort((a,b) => +a.key - +b.key);
+    let txt = '';
+    if(byConfluence.length >= 2){
+      const best = [...byConfluence].filter(g=>g.winRate!=null).sort((a,b)=>b.winRate-a.winRate)[0];
+      const worst = [...byConfluence].filter(g=>g.winRate!=null).sort((a,b)=>a.winRate-b.winRate)[0];
+      if(best && worst && best.key !== worst.key){
+        txt += `${best.key}★ signals win ${(best.winRate*100).toFixed(0)}% of the time vs ${(worst.winRate*100).toFixed(0)}% for ${worst.key}★ — `;
+        txt += best.key > worst.key
+          ? `the confluence score is doing its job, higher-rated signals are performing better.`
+          : `interestingly the lower-rated signals are outperforming here, worth keeping an eye on as more data comes in.`;
+      }
+    }
+    const byPartial = resolved.filter(s => s.partialHit);
+    if(byPartial.length >= 3){
+      const partialThenLoss = byPartial.filter(s => s.status === 'loss').length;
+      if(partialThenLoss > 0) txt += `\n\n${partialThenLoss} of your trades reached the 1:1 partial level but still ended up hitting full SL afterward — if you weren't banking the partial manually, that's lost profit worth securing next time.`;
+    }
+    return txt || 'No strong patterns standing out yet beyond what\'s already in "What are my mistakes?".';
+  }
+
+  window.assistantShow = function(which){
+    const el = document.getElementById('assistantOutput');
+    if(!el) return;
+    const map = { overview: assistantOverview, mistakes: assistantMistakes, state: assistantCurrentState, patterns: assistantPatterns };
+    el.textContent = map[which] ? map[which]() : '';
+  };
+
+  function renderAssistantDefault(){
+    const el = document.getElementById('assistantOutput');
+    if(el) el.textContent = assistantOverview();
+  }
+
   // --- Rules-based trade quality check (not a live AI call — see note in chat) ---
   function assessTradeQuality(symbol, tf, side, entry, sl, tp){
     const slot = state[symbol][tf];
@@ -558,14 +728,14 @@
   }
 
   // --- Trading session detection (Gold behaves differently by session; times in UTC) ---
-  function currentSession(){
-    const h = new Date().getUTCHours();
+  function sessionForHour(h){
     if(h >= 6 && h < 9) return { name: 'London Open', active: true, note: 'high-quality window' };
     if(h >= 9 && h < 16) return { name: 'London/NY overlap', active: true, note: 'high-quality window' };
     if(h >= 16 && h < 21) return { name: 'New York', active: true, note: 'good liquidity' };
     if(h >= 0 && h < 6) return { name: 'Asian session', active: false, note: 'thinner liquidity, lower conviction' };
     return { name: 'Late NY / pre-Asian', active: false, note: 'thinner liquidity, lower conviction' };
   }
+  function currentSession(){ return sessionForHour(new Date().getUTCHours()); }
 
   // --- Liquidity sweep detector: spike beyond a prior swing that immediately reverses ---
   function detectLiquiditySweep(slot){
@@ -1241,9 +1411,12 @@
     const quality = assessTradeQuality(symbol, tf, side, price, sl, tp);
     const goldPlan = symbol === 'frxXAUUSD' ? goldPositionPlan(price, sl, 2) : null;
     const oneToOne = side === 'BUY' ? price + (price - sl) : price - (sl - price);
+    const meta = confluenceMeta || {};
+    const triggerType = meta.sweepConfirmed ? 'sweep' : (meta.freshImpulseFvg ? 'fvg' : 'strat');
+    const fireSession = currentSession().name;
     signalLog.unshift({
       time: new Date(), symbol, tf, side, price, sl, tp, reason, riskAmount, riskPct, quality, goldPlan,
-      confluence, partialTp: oneToOne, beHit: false, partialHit: false, partialPrice: null,
+      confluence, triggerType, session: fireSession, partialTp: oneToOne, beHit: false, partialHit: false, partialPrice: null,
       status: 'open', exitPrice: null, pnl: null
     });
     if(signalLog.length > 50) signalLog.pop();
