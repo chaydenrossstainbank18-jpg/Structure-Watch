@@ -1219,262 +1219,73 @@
   }
 
   // --- Momentum & impulse safety checks ---
-  function safeToFire(slot, side){
+  // =============================================================================
+  // SIGNAL ENGINE — 5 strategies, one hard block (extreme spike only)
+  // =============================================================================
+
+  function isSpikeBlocked(slot, side){
     const c = slot.candles;
-    if(c.length < 6) return { ok: true, reason: '', candleNote: '', macdAgrees: false, momentumAgrees: false };
-
-    // Consecutive momentum — advisory only (used in confluence scoring, not a hard block)
-    const recent = c.slice(-4, -1);
-    const allBull = recent.every(x => x.close > x.open);
-    const allBear = recent.every(x => x.close < x.open);
-    const momentumAgrees = (side === 'BUY' && !allBear) || (side === 'SELL' && !allBull);
-
-    // Impulse spike — HARD BLOCK only: if last closed candle is >3x avg range AND goes against us, skip
+    if(c.length < 6) return false;
     const ranges = c.slice(-15, -1).map(x => x.high - x.low);
-    const avgRange = ranges.length ? ranges.reduce((a,b) => a+b, 0) / ranges.length : 0;
-    const lastClosed = c[c.length - 2];
-    const lastRange = lastClosed.high - lastClosed.low;
-    if(avgRange > 0 && lastRange > avgRange * 3){
-      const spikeDir = lastClosed.close > lastClosed.open ? 'bull' : 'bear';
-      if(side === 'SELL' && spikeDir === 'bull') return { ok: false, reason: 'Blocked: extreme bullish spike (3×+ average range) — don\'t sell into this.', candleNote: '', macdAgrees: false, momentumAgrees };
-      if(side === 'BUY' && spikeDir === 'bear') return { ok: false, reason: 'Blocked: extreme bearish spike (3×+ average range) — don\'t buy into this.', candleNote: '', macdAgrees: false, momentumAgrees };
+    const avg = ranges.reduce((a,b) => a+b, 0) / ranges.length;
+    const last = c[c.length - 2];
+    if(avg > 0 && (last.high - last.low) > avg * 3){
+      const spikeUp = last.close > last.open;
+      if(side === 'SELL' && spikeUp) return true;
+      if(side === 'BUY' && !spikeUp) return true;
     }
-
-    // MACD — advisory only (used in confluence scoring)
-    const macd = calcMACD(c);
-    const macdAgrees = macd ? (side === 'BUY' ? macd.bullish : !macd.bullish) : true;
-
-    // Candle interpretation — advisory only (used in reason text)
-    const triggerCandle = c[c.length - 1];
-    const prevCandle = c[c.length - 2];
-    const interp = classifyCandle(triggerCandle, prevCandle);
-    const candleNote = interp.label;
-
-    return { ok: true, reason: '', candleNote, macdAgrees, momentumAgrees };
+    return false;
   }
 
-  function evaluateStratTrigger(symbol, tf){
-    const slot = state[symbol][tf];
+  function emaCalc(closes, period){
+    if(closes.length < period) return null;
+    const k = 2 / (period + 1);
+    let val = closes.slice(0, period).reduce((a,b) => a+b, 0) / period;
+    for(let i = period; i < closes.length; i++) val = closes[i] * k + val * (1 - k);
+    return val;
+  }
+
+  function getConfluenceNotes(slot, side, price, tf, symbol){
+    const notes = [];
+    let score = 1; // base: structure exists
     const c = slot.candles;
-    if(c.length < 3) return;
-    const sp = detectStratPattern(slot.types.filter(t => t !== null));
-    if(sp){
-      slot.lastStrat = { pattern: sp.pattern, dir: sp.dir, time: new Date() };
-      const dirBias = sp.dir === 'up' ? 'bullish' : 'bearish';
-      const triggerCandle = c[c.length - 1];
-      const range = triggerCandle.high - triggerCandle.low;
-      const body = Math.abs(triggerCandle.close - triggerCandle.open);
-      const strongBody = range > 0 && (body / range) >= 0.4;
-      const htfAligned = isHigherTfAligned(symbol, tf, dirBias);
-      const currentTime = triggerCandle.open_time;
-      const currentPrice = triggerCandle.close;
-      const inOTE = inZone(slot.ote, dirBias, currentPrice);
-      const inPullback = inZone(slot.pullback, dirBias, currentPrice);
-      if(slot.bias === dirBias && strongBody && htfAligned && inPullback && canFire(slot, currentTime, tf)){
-        const side = sp.dir === 'up' ? 'BUY' : 'SELL';
-        const safety = safeToFire(slot, side);
-        if(safety.ok){
-          const brokenLevel = dirBias === 'bullish' ? slot.lastSwingHigh : slot.lastSwingLow;
-          const levelTxt = brokenLevel ? ` Price closed through the prior swing at ${brokenLevel.price.toFixed(2)}.` : '';
-          const htfTxt = tf === '1m' ? ' 5m and 1h not opposing.'
-            : tf === '5m' ? ' 1h not opposing.' : '';
-          const oteTxt = inOTE ? ' ✦ Inside OTE golden pocket — high-precision entry.' : '';
-          const pullbackTxt = ` Pullback measured at ${slot.pullback.bottom.toFixed(2)}–${slot.pullback.top.toFixed(2)} (40–60% retrace) — entry is not chasing an extended move.`;
-          const candleTxt = safety.candleNote ? ` Trigger candle: ${safety.candleNote}.` : '';
-          const macd = calcMACD(c);
-          const session = currentSession();
-          const silverBullet = symbol === 'frxXAUUSD' ? inSilverBulletWindow() : null;
-          const displacement = detectDisplacement(c);
-          const sbTxt = silverBullet ? ` During ${silverBullet.label}.` : '';
-          const fired = fireSignal(symbol, tf, side, currentPrice,
-            `Strat ${sp.pattern} triggered ${dirBias}.${levelTxt}${pullbackTxt}${candleTxt}${sbTxt}${oteTxt}${htfTxt}`,
-            { structureOk: true, htfOk: htfAligned, inOTE: !!inOTE, macdAgrees: macd ? (side === 'BUY' ? macd.bullish : !macd.bullish) : false, freshImpulseFvg: false, sweepConfirmed: false, goodSession: session.active, silverBullet: !!silverBullet, displacement: !!displacement, sniperEntry: false });
-          if(fired) slot.lastFireTime = currentTime;
-        }
-      }
-    }
-    evaluateLiquiditySweep(symbol, tf);
-  }
-
-  function evaluateLiquiditySweep(symbol, tf){
-    const slot = state[symbol][tf];
-    const c = slot.candles;
-    if(c.length < 8) return;
-    const sweep = detectLiquiditySweep(slot);
-    if(!sweep) return;
-    const dirBias = sweep.dir === 'up' ? 'bullish' : 'bearish';
-    const side = sweep.dir === 'up' ? 'BUY' : 'SELL';
-    const currentTime = c[c.length - 1].open_time;
-    const currentPrice = c[c.length - 1].close;
-    const htfAligned = isHigherTfAligned(symbol, tf, dirBias);
-    if(!htfAligned || !canFire(slot, currentTime, tf)) return;
-    const safety = safeToFire(slot, side);
-    if(!safety.ok) return;
-    const inOTE = inZone(slot.ote, dirBias, currentPrice);
-    const htfTxt = tf === '1m' ? ' 5m and 1h not opposing.' : tf === '5m' ? ' 1h not opposing.' : '';
-    const oteTxt = inOTE ? ' ✦ Inside OTE golden pocket.' : '';
-    const candleTxt = safety.candleNote ? ` Reversal candle: ${safety.candleNote}.` : '';
+    const closes = c.map(x => x.close);
+    const e20 = emaCalc(closes, 20), e50 = emaCalc(closes, 50);
+    if(e20 && e50 && ((side === 'BUY' && e20 > e50) || (side === 'SELL' && e20 < e50))){ notes.push('EMA 20/50 trend aligned'); score++; }
     const macd = calcMACD(c);
-    const session = currentSession();
-    const fired = fireSignal(symbol, tf, side, currentPrice,
-      `Liquidity sweep: ${sweep.type} at ${sweep.level.toFixed(2)}, price reversed immediately.${candleTxt}${oteTxt}${htfTxt}`,
-      { structureOk: true, htfOk: htfAligned, inOTE: !!inOTE, macdAgrees: macd ? (side === 'BUY' ? macd.bullish : !macd.bullish) : false, freshImpulseFvg: false, sweepConfirmed: true, goodSession: session.active },
-      sweep.wickExtreme);
-    if(fired) slot.lastFireTime = currentTime;
+    if(macd && ((side === 'BUY' && macd.bullish) || (side === 'SELL' && !macd.bullish))){ notes.push('MACD agrees'); score++; }
+    const htf = tf === '1m' ? state[symbol]['5m'] : tf === '5m' ? state[symbol]['1h'] : null;
+    const dirBias = side === 'BUY' ? 'bullish' : 'bearish';
+    if(!htf || htf.bias !== (dirBias === 'bullish' ? 'bearish' : 'bullish')) score++;
+    const inOTE = inZone(slot.ote, dirBias, price);
+    if(inOTE){ notes.push('OTE golden pocket ✦'); score++; }
+    const sb = symbol === 'frxXAUUSD' ? inSilverBulletWindow() : null;
+    if(sb){ notes.push(sb.label); score++; }
+    const disp = detectDisplacement(c);
+    if(disp){ notes.push('displacement candle (' + (disp.bodyRatio*100).toFixed(0) + '% body)'); score++; }
+    const interp = classifyCandle(c[c.length-1], c[c.length-2]);
+    if(interp.decisive && interp.dir === (side === 'BUY' ? 'up' : 'down')){ notes.push(interp.label); score++; }
+    const starRating = Math.min(5, Math.max(1, Math.round(score * 5 / 8)));
+    return { notes, starRating, inOTE, sb, disp };
   }
 
-  function isHigherTfAligned(symbol, tf, dirBias){
-    const opposite = dirBias === 'bullish' ? 'bearish' : 'bullish';
-    if(tf === '1m'){
-      const fiveM = state[symbol]['5m'].bias;
-      const oneH = state[symbol]['1h'].bias;
-      // Block only if 5m or 1h is directly opposite — neutral is allowed
-      if(fiveM === opposite || oneH === opposite) return false;
-      return true;
-    }
-    if(tf === '5m'){
-      const oneH = state[symbol]['1h'].bias;
-      if(oneH === opposite) return false;
-      return true;
-    }
-    return true;
-  }
-
-  function canFire(slot, currentTime, tf){
-    const tfSeconds = TIMEFRAMES.find(t => t.key === tf).seconds;
-    const cooldown = tfSeconds * 4;
-    if(slot.lastFireTime === undefined) slot.lastFireTime = -Infinity;
-    return (currentTime - slot.lastFireTime) >= cooldown;
-  }
-
-  function checkLiveSignal(symbol, tf, price){
-    const slot = state[symbol][tf];
-    if(!slot.initialized) return;
-    const currentCandle = slot.candles[slot.candles.length - 1];
-    const currentTime = currentCandle ? currentCandle.open_time : Date.now() / 1000;
-    const silverBullet = symbol === 'frxXAUUSD' ? inSilverBulletWindow() : null;
-    const displacement = detectDisplacement(slot.candles);
-    const macd = calcMACD(slot.candles);
-    const session = currentSession();
-
-    slot.fvgs.forEach(z => {
-      if(z.mitigated) return;
-      const inFvgZone = price <= z.top && price >= z.bottom;
-      const sniperLevel = getSniperEntry(z);
-      const atSniperLevel = Math.abs(price - sniperLevel) <= (z.top - z.bottom) * 0.08; // within 8% of midpoint
-
-      // ─── Gold Sniper path: 50% FVG entry during a Silver Bullet window with displacement ───
-      if(symbol === 'frxXAUUSD' && silverBullet && displacement && atSniperLevel && inFvgZone && canFire(slot, currentTime, tf)){
-        const dirBias = z.type;
-        const side = dirBias === 'bullish' ? 'BUY' : 'SELL';
-        if(slot.bias === dirBias && isHigherTfAligned(symbol, tf, dirBias)){
-          const safety = safeToFire(slot, side);
-          if(safety.ok){
-            const inOTE = inZone(slot.ote, dirBias, price);
-            const htfTxt = tf === '1m' ? ' 5m/1h not opposing.' : tf === '5m' ? ' 1h not opposing.' : '';
-            const fired = fireSignal(symbol, tf, side, price,
-              `⚡ GOLD SNIPER: ${silverBullet.label}. Displacement candle (${(displacement.bodyRatio*100).toFixed(0)}% body, ${displacement.rangeMultiple.toFixed(1)}× avg range) created this FVG. Entry at the 50% level (${sniperLevel.toFixed(2)}) for maximum precision, SL placed micro-tight just beyond the FVG edge.${inOTE ? ' ✦ Inside OTE golden pocket too.' : ''}${htfTxt}`,
-              { structureOk: true, htfOk: true, inOTE: !!inOTE, macdAgrees: macd ? (side === 'BUY' ? macd.bullish : !macd.bullish) : false, freshImpulseFvg: true, sweepConfirmed: false, goodSession: session.active, silverBullet: true, displacement: true, sniperEntry: true },
-              z.type === 'bullish' ? z.bottom : z.top, true);
-            if(fired){ slot.lastFireTime = currentTime; z.mitigated = true; }
-            return;
-          }
-        }
-      }
-
-      // ─── Standard FVG path (both Gold and Step) ───
-      if(!inFvgZone) return;
-      if(z.type === 'bullish' && slot.bias === 'bullish' && isHigherTfAligned(symbol, tf, 'bullish') && inZone(slot.pullback, 'bullish', price) && canFire(slot, currentTime, tf)){
-        const inOTE = inZone(slot.ote, 'bullish', price);
-        const htfTxt = tf === '1m' ? ' 5m and 1h not opposing.' : tf === '5m' ? ' 1h not opposing.' : '';
-        const oteTxt = inOTE ? ' ✦ Inside OTE golden pocket.' : '';
-        const sbTxt = silverBullet ? ` During ${silverBullet.label}.` : '';
-        const dTxt = displacement ? ` Strong displacement candle (${(displacement.bodyRatio*100).toFixed(0)}% body) confirmed this FVG.` : '';
-        const pullbackTxt = slot.pullback ? ` Pullback zone ${slot.pullback.bottom.toFixed(2)}–${slot.pullback.top.toFixed(2)} (40–60% retrace).` : '';
-        const safety = safeToFire(slot, 'BUY');
-        if(safety.ok){
-          const candleTxt = safety.candleNote ? ` Trigger candle: ${safety.candleNote}.` : '';
-          const fired = fireSignal(symbol, tf, 'BUY', price,
-            `Bullish FVG retest (${z.bottom.toFixed(2)}–${z.top.toFixed(2)}).${pullbackTxt}${dTxt}${sbTxt}${candleTxt}${oteTxt}${htfTxt}`,
-            { structureOk: true, htfOk: true, inOTE: !!inOTE, macdAgrees: safety.macdAgrees, momentumAgrees: safety.momentumAgrees, freshImpulseFvg: true, sweepConfirmed: false, goodSession: session.active, silverBullet: !!silverBullet, displacement: !!displacement, sniperEntry: false },
-            z.bottom, false);
-          if(fired){ slot.lastFireTime = currentTime; z.mitigated = true; } else { z.mitigated = false; }
-        } else { z.mitigated = false; }
-      } else if(z.type === 'bearish' && slot.bias === 'bearish' && isHigherTfAligned(symbol, tf, 'bearish') && inZone(slot.pullback, 'bearish', price) && canFire(slot, currentTime, tf)){
-        const inOTE = inZone(slot.ote, 'bearish', price);
-        const htfTxt = tf === '1m' ? ' 5m and 1h not opposing.' : tf === '5m' ? ' 1h not opposing.' : '';
-        const oteTxt = inOTE ? ' ✦ Inside OTE golden pocket.' : '';
-        const sbTxt = silverBullet ? ` During ${silverBullet.label}.` : '';
-        const dTxt = displacement ? ` Strong displacement candle (${(displacement.bodyRatio*100).toFixed(0)}% body) confirmed this FVG.` : '';
-        const pullbackTxt = slot.pullback ? ` Pullback zone ${slot.pullback.bottom.toFixed(2)}–${slot.pullback.top.toFixed(2)} (40–60% retrace).` : '';
-        const safety = safeToFire(slot, 'SELL');
-        if(safety.ok){
-          const candleTxt = safety.candleNote ? ` Trigger candle: ${safety.candleNote}.` : '';
-          const fired = fireSignal(symbol, tf, 'SELL', price,
-            `Bearish FVG retest (${z.bottom.toFixed(2)}–${z.top.toFixed(2)}).${pullbackTxt}${dTxt}${sbTxt}${candleTxt}${oteTxt}${htfTxt}`,
-            { structureOk: true, htfOk: true, inOTE: !!inOTE, macdAgrees: safety.macdAgrees, momentumAgrees: safety.momentumAgrees, freshImpulseFvg: true, sweepConfirmed: false, goodSession: session.active, silverBullet: !!silverBullet, displacement: !!displacement, sniperEntry: false },
-            z.top, false);
-          if(fired){ slot.lastFireTime = currentTime; z.mitigated = true; } else { z.mitigated = false; }
-        } else { z.mitigated = false; }
-      } else if(slot.bias !== 'bullish' && slot.bias !== 'bearish'){
-        z.mitigated = true;
-      } else if((z.type === 'bullish' && slot.bias === 'bearish') || (z.type === 'bearish' && slot.bias === 'bullish')){
-        z.mitigated = true;
-      }
-    });
-  }
-
-  function getSLTP(symbol, tf, side, entry, tightRef, isSniper){
-    const slot = state[symbol][tf];
-    let sl;
-    if(isSniper && tightRef != null){
-      // Sniper entry: SL sits just beyond the FVG edge with a micro buffer — tightest possible
-      const buffer = entry * 0.00008; // ~$0.32 on Gold at $4000 — very precise
-      sl = side === 'BUY' ? tightRef - buffer : tightRef + buffer;
-    } else if(tightRef != null){
-      // Standard structural reference (FVG edge or sweep wick) with a small buffer
-      const buffer = entry * 0.00012; // ~$0.48 on Gold at $4000 — tighter than before
-      sl = side === 'BUY' ? tightRef - buffer : tightRef + buffer;
-    } else {
-      // Fallback swing-based stop — reduced buffer
-      const buffer = entry * 0.00025; // ~$1 on Gold at $4000 — still tighter than original
-      const fallback = slot.candles.slice(-12, -1);
-      if(side === 'BUY'){
-        const swingLow = slot.lastSwingLow ? slot.lastSwingLow.price : Math.min(...fallback.map(x => x.low));
-        sl = swingLow - buffer;
-      } else {
-        const swingHigh = slot.lastSwingHigh ? slot.lastSwingHigh.price : Math.max(...fallback.map(x => x.high));
-        sl = swingHigh + buffer;
-      }
-    }
-    const risk = Math.abs(entry - sl);
-    const tp = side === 'BUY' ? entry + risk * 3 : entry - risk * 3;
-    return { sl, tp, isSniper: !!isSniper };
-  }
-
-  // --- Gold-only position sizing for a fixed max risk, entirely separate from signal-firing logic ---
-  function goldPositionPlan(entry, sl, maxRiskUsd){
-    const slDistance = Math.abs(entry - sl);
-    const dollarPerPointPerLot = pointValue.frxXAUUSD * 10; // $10/point at 0.1 lot → $100/point at 1.0 lot
-    const rawLot = maxRiskUsd / (slDistance * dollarPerPointPerLot);
-    const roundedLot = Math.floor(rawLot * 100) / 100;
-    const minLot = 0.01;
-    const minLotRisk = minLot * slDistance * dollarPerPointPerLot;
-    if(roundedLot >= minLot){
-      const actualRisk = roundedLot * slDistance * dollarPerPointPerLot;
-      return { achievable: true, lot: roundedLot, actualRisk, slDistance };
-    }
-    return { achievable: false, minLot, minLotRisk, slDistance };
-  }
-
-  function fireSignal(symbol, tf, side, price, reason, confluenceMeta, tightRef, isSniper){
+  function tryFire(symbol, tf, side, price, reason, tightRef, isSniper){
     if(dailyLossLimitReached()) return false;
-    const confluence = scoreConfluence(confluenceMeta || {});
-    if(confluence < MIN_CONFLUENCE) return false;
+    const slot = state[symbol][tf];
+    const dirBias = side === 'BUY' ? 'bullish' : 'bearish';
+    const opposite = dirBias === 'bullish' ? 'bearish' : 'bullish';
+    if(slot.bias !== dirBias) return false;
+    const htf = tf === '1m' ? state[symbol]['5m'] : tf === '5m' ? state[symbol]['1h'] : null;
+    if(htf && htf.bias === opposite) return false;
+    if(isSpikeBlocked(slot, side)) return false;
+    const lastCandle = slot.candles[slot.candles.length - 1];
+    const now = lastCandle ? lastCandle.open_time : Date.now() / 1000;
+    const tfSec = TIMEFRAMES.find(t => t.key === tf).seconds;
+    if(slot.lastFireTime && (now - slot.lastFireTime) < tfSec * 3) return false;
     const symState = state[symbol];
-    if(symState.lastSignalDir && symState.lastSignalDir !== side && (Date.now() - symState.lastSignalTime) < OPPOSITE_LOCK_MS){
-      return false;
-    }
+    if(symState.lastSignalDir && symState.lastSignalDir !== side && (Date.now() - symState.lastSignalTime) < 3 * 60 * 1000) return false;
+
+    const { notes, starRating } = getConfluenceNotes(slot, side, price, tf, symbol);
     const { sl, tp } = getSLTP(symbol, tf, side, price, tightRef, isSniper);
     const balance = parseFloat(acctBalanceEl.value);
     const riskPct = parseFloat(riskPctEl.value) || 1;
@@ -1482,15 +1293,17 @@
     const quality = assessTradeQuality(symbol, tf, side, price, sl, tp);
     const goldPlan = symbol === 'frxXAUUSD' ? goldPositionPlan(price, sl, 2) : null;
     const oneToOne = side === 'BUY' ? price + (price - sl) : price - (sl - price);
-    const triggerType = meta.sweepConfirmed ? 'sweep' : (meta.freshImpulseFvg ? (isSniper ? 'sniper' : 'fvg') : 'strat');
-    const fireSession = currentSession().name;
+    const fullReason = reason + (notes.length ? ' · ' + notes.join(', ') + '.' : '');
     signalLog.unshift({
-      time: new Date(), symbol, tf, side, price, sl, tp, reason, riskAmount, riskPct, quality, goldPlan,
-      confluence, triggerType, session: fireSession, isSniper: !!isSniper,
+      time: new Date(), symbol, tf, side, price, sl, tp, reason: fullReason,
+      riskAmount, riskPct, quality, goldPlan, confluence: starRating,
+      triggerType: isSniper ? 'sniper' : (tightRef != null ? 'fvg' : 'strat'),
+      session: currentSession().name, isSniper: !!isSniper,
       partialTp: oneToOne, beHit: false, partialHit: false, partialPrice: null,
       status: 'open', exitPrice: null, pnl: null
     });
     if(signalLog.length > 50) signalLog.pop();
+    slot.lastFireTime = now;
     symState.lastSignalDir = side;
     symState.lastSignalTime = Date.now();
     renderLog();
@@ -1498,10 +1311,91 @@
     saveSignalLog();
     bumpDailyCount();
     const sym = SYMBOLS.find(x => x.code === symbol);
-    notify(`${side} ${sym ? sym.name : symbol} · ${tf} · ${'★'.repeat(confluence)}`, reason);
+    notify((isSniper ? '⚡ SNIPER ' : '') + side + ' ' + (sym ? sym.name : symbol) + ' · ' + tf + ' · ' + '★'.repeat(starRating), reason);
     emailSignal(symbol, side, sl, tp, price);
     return true;
   }
+
+  // Strategy 1: FVG retest
+  function checkLiveSignal(symbol, tf, price){
+    const slot = state[symbol][tf];
+    if(!slot.initialized) return;
+    const lastCandle = slot.candles[slot.candles.length - 1];
+    slot.fvgs.forEach(z => {
+      if(z.mitigated) return;
+      const inFvg = price <= z.top && price >= z.bottom;
+      if(!inFvg) return;
+      const side = z.type === 'bullish' ? 'BUY' : 'SELL';
+      // Sniper: 50% FVG level during Silver Bullet + displacement (Gold only)
+      if(symbol === 'frxXAUUSD' && inSilverBulletWindow() && detectDisplacement(slot.candles)){
+        const mid = (z.top + z.bottom) / 2;
+        if(Math.abs(price - mid) <= (z.top - z.bottom) * 0.12){
+          if(tryFire(symbol, tf, side, price, '⚡ GOLD SNIPER: FVG 50% level ' + mid.toFixed(2) + ' during Silver Bullet window', z.type === 'bullish' ? z.bottom : z.top, true)){ z.mitigated = true; return; }
+        }
+      }
+      // Standard FVG entry
+      if(tryFire(symbol, tf, side, price, 'FVG retest: ' + z.type + ' gap ' + z.bottom.toFixed(2) + '–' + z.top.toFixed(2), z.type === 'bullish' ? z.bottom : z.top, false)){ z.mitigated = true; }
+    });
+  }
+
+  // Strategy 2: Strat candle patterns
+  function evaluateStratTrigger(symbol, tf){
+    const slot = state[symbol][tf];
+    const c = slot.candles;
+    if(c.length < 4) return;
+    const sp = detectStratPattern(slot.types.filter(t => t !== null));
+    if(sp){
+      slot.lastStrat = { pattern: sp.pattern, dir: sp.dir, time: new Date() };
+      const side = sp.dir === 'up' ? 'BUY' : 'SELL';
+      const price = c[c.length - 1].close;
+      const swingRef = side === 'BUY' ? slot.lastSwingLow : slot.lastSwingHigh;
+      tryFire(symbol, tf, side, price, 'Strat ' + sp.pattern + ' pattern' + (swingRef ? ' — prior swing ' + swingRef.price.toFixed(2) : ''), null, false);
+    }
+    evaluateLiquiditySweep(symbol, tf);
+    evaluateEMACross(symbol, tf);
+    evaluateBOSSignal(symbol, tf);
+  }
+
+  // Strategy 3: EMA 20/50 crossover
+  function evaluateEMACross(symbol, tf){
+    const slot = state[symbol][tf];
+    const c = slot.candles;
+    if(c.length < 55) return;
+    const closes = c.map(x => x.close);
+    const curr20 = emaCalc(closes, 20), curr50 = emaCalc(closes, 50);
+    const prev20 = emaCalc(closes.slice(0,-1), 20), prev50 = emaCalc(closes.slice(0,-1), 50);
+    if(!curr20||!curr50||!prev20||!prev50) return;
+    if(prev20 <= prev50 && curr20 > curr50) tryFire(symbol, tf, 'BUY', c[c.length-1].close, 'EMA 20 crossed above EMA 50 — trend turning bullish', null, false);
+    if(prev20 >= prev50 && curr20 < curr50) tryFire(symbol, tf, 'SELL', c[c.length-1].close, 'EMA 20 crossed below EMA 50 — trend turning bearish', null, false);
+  }
+
+  // Strategy 4: Liquidity sweep
+  function evaluateLiquiditySweep(symbol, tf){
+    const slot = state[symbol][tf];
+    const c = slot.candles;
+    if(c.length < 8) return;
+    const sweep = detectLiquiditySweep(slot);
+    if(!sweep) return;
+    const side = sweep.dir === 'up' ? 'BUY' : 'SELL';
+    tryFire(symbol, tf, side, c[c.length-1].close, 'Liquidity sweep: ' + sweep.type + ' at ' + sweep.level.toFixed(2), sweep.wickExtreme, false);
+  }
+
+  // Strategy 5: BOS / CHoCH direct signal
+  function evaluateBOSSignal(symbol, tf){
+    const slot = state[symbol][tf];
+    const events = slot.events;
+    if(!events.length) return;
+    const latest = events[events.length - 1];
+    const c = slot.candles;
+    if(!c.length) return;
+    const last = c[c.length - 1];
+    const tfSec = TIMEFRAMES.find(t => t.key === tf).seconds;
+    if((last.open_time - latest.time) > tfSec * 2) return;
+    const side = latest.dir === 'up' ? 'BUY' : 'SELL';
+    tryFire(symbol, tf, side, last.close, latest.type + ': confirmed ' + (latest.dir === 'up' ? 'bullish' : 'bearish') + ' structure break', null, false);
+  }
+
+  function fireSignal(){ return true; } // legacy stub — tryFire() is the real entry point
 
   function renderLog(){
     const el = document.getElementById('logList');
