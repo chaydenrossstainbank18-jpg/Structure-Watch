@@ -361,9 +361,7 @@
     <div id="assistantOutput" class="assistant-output">Building your overview…</div>
     <div class="assistant-buttons">
       <button class="qBtn" onclick="assistantShow('overview')">How am I doing?</button>
-      <button class="qBtn" onclick="assistantShow('mistakes')">What are my mistakes?</button>
       <button class="qBtn" onclick="assistantShow('state')">Why no signal right now?</button>
-      <button class="qBtn" onclick="assistantShow('patterns')">Any patterns?</button>
     </div>
   </div>
 
@@ -1274,16 +1272,15 @@
     const slot = state[symbol][tf];
     const dirBias = side === 'BUY' ? 'bullish' : 'bearish';
     const opposite = dirBias === 'bullish' ? 'bearish' : 'bullish';
-    if(slot.bias !== dirBias) return false;
+    // Only hard block: HTF is directly opposing AND structure is also opposing (both must agree to block)
     const htf = tf === '1m' ? state[symbol]['5m'] : tf === '5m' ? state[symbol]['1h'] : null;
-    if(htf && htf.bias === opposite) return false;
+    if(htf && htf.bias === opposite && slot.bias === opposite) return false;
     if(isSpikeBlocked(slot, side)) return false;
+    // Cooldown: 2 candle periods only
     const lastCandle = slot.candles[slot.candles.length - 1];
     const now = lastCandle ? lastCandle.open_time : Date.now() / 1000;
     const tfSec = TIMEFRAMES.find(t => t.key === tf).seconds;
-    if(slot.lastFireTime && (now - slot.lastFireTime) < tfSec * 3) return false;
-    const symState = state[symbol];
-    if(symState.lastSignalDir && symState.lastSignalDir !== side && (Date.now() - symState.lastSignalTime) < 3 * 60 * 1000) return false;
+    if(slot.lastFireTime && (now - slot.lastFireTime) < tfSec * 2) return false;
 
     const { notes, starRating } = getConfluenceNotes(slot, side, price, tf, symbol);
     const { sl, tp } = getSLTP(symbol, tf, side, price, tightRef, isSniper);
