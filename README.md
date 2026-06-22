@@ -1,2 +1,2 @@
-# Structure-Watch
+# Structure
 Monitoring
