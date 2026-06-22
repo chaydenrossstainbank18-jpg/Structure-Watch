@@ -185,6 +185,9 @@
     border-color: rgba(240,86,111,0.3);
   }
   .gold-plan.unreachable .gp-label{ color: var(--short); }
+  .block-reason{ font-family:'JetBrains Mono', monospace; font-size: 10px; color: var(--mute); margin-top: 4px; min-height: 12px; line-height: 1.4; }
+  .block-reason.watching{ color: var(--long); }
+  .block-reason.blocked{ color: var(--short); }
 
   .assistant-output{
     font-size: 13px; line-height: 1.6; color: var(--ink);
@@ -303,6 +306,7 @@
     </div>
     <div class="tf-strip" id="strip-frxXAUUSD"></div>
     <div class="trigger-line" id="trigger-frxXAUUSD"></div>
+    <div class="block-reason" id="block-frxXAUUSD"></div>
     <canvas id="chart-frxXAUUSD"></canvas>
     <div class="fvg-chips" id="fvg-frxXAUUSD"><div class="fvg-empty">No active FVG zones yet</div></div>
   </div>
@@ -317,6 +321,7 @@
     </div>
     <div class="tf-strip" id="strip-stpRNG"></div>
     <div class="trigger-line" id="trigger-stpRNG"></div>
+    <div class="block-reason" id="block-stpRNG"></div>
     <canvas id="chart-stpRNG"></canvas>
     <div class="fvg-chips" id="fvg-stpRNG"><div class="fvg-empty">No active FVG zones yet</div></div>
   </div>
@@ -758,7 +763,7 @@
     return null;
   }
 
-  const MIN_CONFLUENCE = 3;
+  const MIN_CONFLUENCE = 2;
   const OPPOSITE_LOCK_MS = 10 * 60 * 1000;
 
   // --- ICT Silver Bullet windows for Gold (UTC hours) ---
@@ -800,19 +805,20 @@
   }
 
   // --- Confluence scoring ---
-  function scoreConfluence({ structureOk, htfOk, inOTE, macdAgrees, freshImpulseFvg, sweepConfirmed, goodSession, silverBullet, displacement, sniperEntry }){
+  function scoreConfluence({ structureOk, htfOk, inOTE, macdAgrees, momentumAgrees, freshImpulseFvg, sweepConfirmed, goodSession, silverBullet, displacement, sniperEntry }){
     let score = 0;
     if(structureOk) score++;
     if(htfOk) score++;
     if(inOTE) score++;
     if(macdAgrees) score++;
+    if(momentumAgrees) score++;
     if(freshImpulseFvg) score++;
     if(sweepConfirmed) score++;
     if(goodSession) score++;
-    if(silverBullet) score++;    // bonus: inside an institutional time window
-    if(displacement) score++;   // bonus: a real displacement candle caused the FVG
-    if(sniperEntry) score++;    // bonus: entering at the precise 50% level
-    return Math.min(5, Math.max(1, Math.round(score * 5 / 10)));
+    if(silverBullet) score++;
+    if(displacement) score++;
+    if(sniperEntry) score++;
+    return Math.min(5, Math.max(1, Math.round(score * 5 / 11)));
   }
   const acctBalanceEl = document.getElementById('acctBalance');
   const riskPctEl = document.getElementById('riskPct');
@@ -1130,10 +1136,10 @@
       const swingL = lastSwingLow.price;
       if(slot.bias === 'bullish'){
         slot.ote = { top: swingL + (swingH - swingL) * 0.38, bottom: swingL + (swingH - swingL) * 0.21, type: 'bullish' };
-        slot.pullback = { top: swingL + (swingH - swingL) * 0.60, bottom: swingL + (swingH - swingL) * 0.40, type: 'bullish' };
+        slot.pullback = { top: swingL + (swingH - swingL) * 0.70, bottom: swingL + (swingH - swingL) * 0.30, type: 'bullish' };
       } else if(slot.bias === 'bearish'){
         slot.ote = { top: swingH - (swingH - swingL) * 0.21, bottom: swingH - (swingH - swingL) * 0.38, type: 'bearish' };
-        slot.pullback = { top: swingH - (swingH - swingL) * 0.40, bottom: swingH - (swingH - swingL) * 0.60, type: 'bearish' };
+        slot.pullback = { top: swingH - (swingH - swingL) * 0.30, bottom: swingH - (swingH - swingL) * 0.70, type: 'bearish' };
       } else {
         slot.ote = null;
         slot.pullback = null;
@@ -1215,45 +1221,36 @@
   // --- Momentum & impulse safety checks ---
   function safeToFire(slot, side){
     const c = slot.candles;
-    if(c.length < 6) return { ok: true, reason: '' };
+    if(c.length < 6) return { ok: true, reason: '', candleNote: '', macdAgrees: false, momentumAgrees: false };
 
-    // 1. Consecutive candle momentum — if last 3 closed candles all go the same way, block opposite
+    // Consecutive momentum — advisory only (used in confluence scoring, not a hard block)
     const recent = c.slice(-4, -1);
     const allBull = recent.every(x => x.close > x.open);
     const allBear = recent.every(x => x.close < x.open);
-    if(side === 'SELL' && allBull) return { ok: false, reason: 'Blocked: 3 consecutive bullish closes — momentum is against this sell.' };
-    if(side === 'BUY' && allBear) return { ok: false, reason: 'Blocked: 3 consecutive bearish closes — momentum is against this buy.' };
+    const momentumAgrees = (side === 'BUY' && !allBear) || (side === 'SELL' && !allBull);
 
-    // 2. Impulse spike — if the most recent closed candle is >2.5x the avg recent range, block counter-direction
+    // Impulse spike — HARD BLOCK only: if last closed candle is >3x avg range AND goes against us, skip
     const ranges = c.slice(-15, -1).map(x => x.high - x.low);
     const avgRange = ranges.length ? ranges.reduce((a,b) => a+b, 0) / ranges.length : 0;
     const lastClosed = c[c.length - 2];
     const lastRange = lastClosed.high - lastClosed.low;
-    if(avgRange > 0 && lastRange > avgRange * 2.5){
+    if(avgRange > 0 && lastRange > avgRange * 3){
       const spikeDir = lastClosed.close > lastClosed.open ? 'bull' : 'bear';
-      if(side === 'SELL' && spikeDir === 'bull') return { ok: false, reason: 'Blocked: impulse bullish spike — selling into momentum is too risky.' };
-      if(side === 'BUY' && spikeDir === 'bear') return { ok: false, reason: 'Blocked: impulse bearish spike — buying into momentum is too risky.' };
+      if(side === 'SELL' && spikeDir === 'bull') return { ok: false, reason: 'Blocked: extreme bullish spike (3×+ average range) — don\'t sell into this.', candleNote: '', macdAgrees: false, momentumAgrees };
+      if(side === 'BUY' && spikeDir === 'bear') return { ok: false, reason: 'Blocked: extreme bearish spike (3×+ average range) — don\'t buy into this.', candleNote: '', macdAgrees: false, momentumAgrees };
     }
 
-    // 3. MACD direction — must agree with trade direction
+    // MACD — advisory only (used in confluence scoring)
     const macd = calcMACD(c);
-    if(macd){
-      if(side === 'SELL' && macd.bullish) return { ok: false, reason: 'Blocked: MACD is above signal line (bullish) — no sells while momentum is up.' };
-      if(side === 'BUY' && !macd.bullish) return { ok: false, reason: 'Blocked: MACD is below signal line (bearish) — no buys while momentum is down.' };
-    }
+    const macdAgrees = macd ? (side === 'BUY' ? macd.bullish : !macd.bullish) : true;
 
-    // 4. Candle interpretation — the trigger candle itself must show real conviction, not indecision
+    // Candle interpretation — advisory only (used in reason text)
     const triggerCandle = c[c.length - 1];
     const prevCandle = c[c.length - 2];
     const interp = classifyCandle(triggerCandle, prevCandle);
-    if(!interp.decisive){
-      return { ok: false, reason: `Blocked: trigger candle is ${interp.label} — not enough conviction to act on.` };
-    }
-    if(interp.dir && ((side === 'BUY' && interp.dir === 'down') || (side === 'SELL' && interp.dir === 'up'))){
-      return { ok: false, reason: `Blocked: trigger candle reads as ${interp.label}, which contradicts a ${side.toLowerCase()}.` };
-    }
+    const candleNote = interp.label;
 
-    return { ok: true, reason: '', candleNote: interp.label };
+    return { ok: true, reason: '', candleNote, macdAgrees, momentumAgrees };
   }
 
   function evaluateStratTrigger(symbol, tf){
@@ -1399,7 +1396,7 @@
           const candleTxt = safety.candleNote ? ` Trigger candle: ${safety.candleNote}.` : '';
           const fired = fireSignal(symbol, tf, 'BUY', price,
             `Bullish FVG retest (${z.bottom.toFixed(2)}–${z.top.toFixed(2)}).${pullbackTxt}${dTxt}${sbTxt}${candleTxt}${oteTxt}${htfTxt}`,
-            { structureOk: true, htfOk: true, inOTE: !!inOTE, macdAgrees: macd ? macd.bullish : false, freshImpulseFvg: true, sweepConfirmed: false, goodSession: session.active, silverBullet: !!silverBullet, displacement: !!displacement, sniperEntry: false },
+            { structureOk: true, htfOk: true, inOTE: !!inOTE, macdAgrees: safety.macdAgrees, momentumAgrees: safety.momentumAgrees, freshImpulseFvg: true, sweepConfirmed: false, goodSession: session.active, silverBullet: !!silverBullet, displacement: !!displacement, sniperEntry: false },
             z.bottom, false);
           if(fired){ slot.lastFireTime = currentTime; z.mitigated = true; } else { z.mitigated = false; }
         } else { z.mitigated = false; }
@@ -1415,7 +1412,7 @@
           const candleTxt = safety.candleNote ? ` Trigger candle: ${safety.candleNote}.` : '';
           const fired = fireSignal(symbol, tf, 'SELL', price,
             `Bearish FVG retest (${z.bottom.toFixed(2)}–${z.top.toFixed(2)}).${pullbackTxt}${dTxt}${sbTxt}${candleTxt}${oteTxt}${htfTxt}`,
-            { structureOk: true, htfOk: true, inOTE: !!inOTE, macdAgrees: macd ? !macd.bullish : false, freshImpulseFvg: true, sweepConfirmed: false, goodSession: session.active, silverBullet: !!silverBullet, displacement: !!displacement, sniperEntry: false },
+            { structureOk: true, htfOk: true, inOTE: !!inOTE, macdAgrees: safety.macdAgrees, momentumAgrees: safety.momentumAgrees, freshImpulseFvg: true, sweepConfirmed: false, goodSession: session.active, silverBullet: !!silverBullet, displacement: !!displacement, sniperEntry: false },
             z.top, false);
           if(fired){ slot.lastFireTime = currentTime; z.mitigated = true; } else { z.mitigated = false; }
         } else { z.mitigated = false; }
@@ -1583,11 +1580,40 @@
       if(activeSlot.pullback){
         txt += `  ·  Pullback ${activeSlot.pullback.bottom.toFixed(2)}–${activeSlot.pullback.top.toFixed(2)}`;
       }
+
       triggerEl.textContent = txt + sbBadge;
     } else if(activeSlot.pullback){
       triggerEl.textContent = `Pullback zone (entry gate): ${activeSlot.pullback.bottom.toFixed(2)}–${activeSlot.pullback.top.toFixed(2)}${sbBadge}`;
     } else {
       triggerEl.textContent = sbBadge || '';
+    }
+
+    // --- Live block-reason diagnostic ---
+    const blockEl = document.getElementById('block-' + symbol);
+    if(blockEl && sym.lastPrice !== null){
+      const price = sym.lastPrice;
+      const reasons = [];
+      if(activeSlot.bias === 'neutral') reasons.push('structure neutral — no bias yet');
+      if(activeSlot.pullback){
+        const inPb = price <= activeSlot.pullback.top && price >= activeSlot.pullback.bottom;
+        if(!inPb) reasons.push(`price (${price.toFixed(2)}) outside pullback zone ${activeSlot.pullback.bottom.toFixed(2)}–${activeSlot.pullback.top.toFixed(2)}`);
+      } else {
+        reasons.push('no pullback zone yet — waiting for swing to establish');
+      }
+      const htfCheck = ['bullish','bearish'].map(dir => isHigherTfAligned(symbol, sym.activeTf, dir) ? null : dir).filter(Boolean);
+      if(htfCheck.length === 2) reasons.push('higher timeframe opposing both directions');
+      const safety = safeToFire(activeSlot, activeSlot.bias === 'bullish' ? 'BUY' : 'SELL');
+      if(!safety.ok) reasons.push(safety.reason);
+      const noFvg = !activeSlot.fvgs.some(z => !z.mitigated);
+      if(noFvg) reasons.push('no unmitigated FVG zones active');
+      if(dailyLossLimitReached()) reasons.push('daily loss limit hit — signals paused');
+      if(reasons.length === 0){
+        blockEl.className = 'block-reason watching';
+        blockEl.textContent = 'Watching — conditions can align, waiting for price to touch an FVG or Strat trigger to close.';
+      } else {
+        blockEl.className = 'block-reason blocked';
+        blockEl.textContent = 'Not firing: ' + reasons.join(' · ');
+      }
     }
 
     const fvgEl = document.getElementById('fvg-' + symbol);
